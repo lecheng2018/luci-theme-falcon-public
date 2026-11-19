@@ -1,0 +1,12 @@
+# Build artefacts
+dist/.stage/
+
+# OS / editor noise
+.DS_Store
+*.swp
+*.bak
+*~
+
+# Python cache
+__pycache__/
+*.py[cod]

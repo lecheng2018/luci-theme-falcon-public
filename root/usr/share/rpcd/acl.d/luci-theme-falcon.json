@@ -1,0 +1,24 @@
+{
+	"falcon-theme": {
+		"description": "Falcon theme helpers, dashboard data sources and per-client QoS control",
+		"read": {
+			"file": {
+				"/usr/libexec/falcon-wifi-temp": [ "exec" ]
+			},
+			"ubus": {
+				"luci.client-rates": [ "get" ],
+				"luci-rpc": [ "getDHCPLeases", "getHostHints" ],
+				"hqos": [ "status", "get" ],
+				"network.interface": [ "dump" ],
+				"network.device": [ "status" ]
+			},
+			"uci": [ "hqos", "network" ]
+		},
+		"write": {
+			"ubus": {
+				"hqos": [ "set" ]
+			},
+			"uci": [ "hqos" ]
+		}
+	}
+}
