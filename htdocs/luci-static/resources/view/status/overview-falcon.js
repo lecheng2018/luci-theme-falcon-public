@@ -519,28 +519,16 @@ return view.extend({
 			.replace(/\s+/g, ' ')
 			.trim();
 
-		/* wifi radio temperatures from the ACL-granted helper.
-		   The helper auto-discovers radios via iwinfo; here we map each
-		   reporting device to its band (frequency from iwinfo, dynamic) and
-		   keep the first reading per band. */
-		var bandOf = function(dev) {
-			var found = null;
-			(this.wifiInfos || []).forEach(function(w) {
-				if (w.device === dev && w.info && w.info.frequency)
-					found = w.info.frequency >= 5000 ? '5G' : '2.4G';
-			});
-			return found || dev;
-		}.bind(this);
-
+		/* wifi radio temperatures from the ACL-granted helper, which
+		   auto-discovers radios via iwinfo. One reading per radio, in the order
+		   the helper reports them. Band names are deliberately omitted: this row
+		   is a temperature readout, not a radio listing, so "2.4G / 5G" prefixes
+		   only add noise. */
 		var wifiParts = [];
-		var seenBands = {};
 		Object.keys(wifiTemps || {}).forEach(function(dev) {
-			var t = wifiTemps[dev];
-			if (t == null) return;
-			var band = bandOf(dev);
-			if (seenBands[band]) return;
-			seenBands[band] = true;
-			wifiParts.push(band + ' ' + parseFloat(t).toFixed(1) + ' °C');
+			var t = parseFloat(wifiTemps[dev]);
+			if (!isFinite(t)) return;
+			wifiParts.push(t.toFixed(1) + ' °C');
 		});
 		var wifiTempStr = wifiParts.length ? wifiParts.join(' · ') : '—';
 

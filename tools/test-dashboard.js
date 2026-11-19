@@ -380,6 +380,14 @@ instance.load().then(data => {
 	console.log('ok    架构 row stripped of temperature, no duplicates');
 	console.log('ok    unified 温度 row rendered directly under 架构: CPU / Wi-Fi');
 
+	/* Wi-Fi 温度不得带频段标注（2.4G / 5G）——这一行只是温度读数，不是射频列表 */
+	const tempRow = normText.slice(tempIdx, targetIdx);
+	if (/2\.4G|5G/.test(tempRow)) {
+		console.log('FAIL: Wi-Fi temperature still labelled with band names:', tempRow);
+		process.exit(1);
+	}
+	console.log('ok    Wi-Fi temperature has no band labels');
+
 	const cpuT = /([\d.]+)\s*°C/.exec((fixture.cpuinfo && fixture.cpuinfo.cpuinfo) || '');
 
 
