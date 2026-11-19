@@ -40,9 +40,13 @@ fixture.clientRates = {
 	totals: { 'AA:BB:CC:DD:EE:01': 1_000_000 },
 	traffic: {
 		'AA:BB:CC:DD:EE:01': { upload: 400_000, download: 600_000 },
-		'AA:BB:CC:DD:EE:02': { upload: 200_000, download: 300_000 }
+		'AA:BB:CC:DD:EE:02': { upload: 200_000, download: 300_000 },
+		'0A:11:22:33:44:55': { upload: 10_000, download: 20_000 }
 	},
-	connections: { 'AA:BB:CC:DD:EE:01': 5 },
+	connections: { 'AA:BB:CC:DD:EE:01': 5,
+		'0A:11:22:33:44:55': 7,          /* 随机 MAC（本地管理位=1） */
+		'AA:BB:CC:DD:EE:77': 0 },        /* 纯空闲残留：无名字、无流量、无连接 */
+	/* 上面这台 0A: 开头是随机 MAC 的典型形态，应标为「随机 MAC 设备」而不是未命名 */
 	routed_connections: { 'AA:BB:CC:DD:EE:01': 4 }
 };
 fixture.hints = {
@@ -524,18 +528,18 @@ instance.load().then(data => {
 			process.exit(1);
 		}
 		/* 夹具 connections 之和 = 12 + 3 + 756 = 771 */
-		if (!/连接数\s*5/.test(norm(t2))) {
+		if (!/连接数\s*12/.test(norm(t2))) {
 			const m = /连接数\D{0,12}/.exec(norm(t2));
 			console.log('FAIL: 连接数 total wrong, got: ' + (m ? m[0] : 'n/a'));
 			process.exit(1);
 		}
-		console.log('ok    整机连接数 rendered (5, summed from conntrack)');
-		if (!/经路由\s*4/.test(norm(t2))) {
-			const m = /经路由\D{0,12}/.exec(norm(t2));
-			console.log('FAIL: 经路由 count wrong, got: ' + (m ? m[0] : 'n/a'));
+		console.log('ok    整机连接数 rendered (12 = 5+7+0, summed from conntrack)');
+		/* 「经路由」附注已移除：主界面只留总连接数 */
+		if (/经路由/.test(norm(t2))) {
+			console.log('FAIL: 经路由 annotation should be gone');
 			process.exit(1);
 		}
-		console.log('ok    经路由连接数 rendered (4)');
+		console.log('ok    连接数 shows the total only (no routed sub-count)');
 
 		/* 端口并入光纤物理链路卡：不应再有独立的「网络」卡 */
 		const cardTitles = out.querySelectorAll('.card-title')
@@ -583,6 +587,27 @@ instance.load().then(data => {
 				process.exit(1);
 			}
 			console.log('ok    typed limit survives a poll (clients card reused)');
+
+		/* 未知名设备治理：随机 MAC 必须标明，纯空闲残留必须被过滤掉 */
+		const txt = out.textContent.replace(/\s+/g, ' ');
+		if (!/随机 MAC 设备/.test(txt)) {
+			console.log('FAIL: locally-administered MAC not labelled as 随机 MAC 设备');
+			process.exit(1);
+		}
+		console.log('ok    randomized MAC labelled (随机 MAC 设备)');
+		if (/AA:BB:CC:DD:EE:77/.test(txt)) {
+			console.log('FAIL: fully idle entry should be filtered out of the list');
+			process.exit(1);
+		}
+		console.log('ok    idle residue filtered out (no traffic / no name / no limit)');
+		/* 具名设备排在随机 MAC 之前 */
+		const namedIdx = txt.indexOf('host-a');
+		const rndIdx = txt.indexOf('随机 MAC 设备');
+		if (!(namedIdx >= 0 && rndIdx >= 0 && namedIdx < rndIdx)) {
+			console.log('FAIL: named clients should sort before randomized ones');
+			process.exit(1);
+		}
+		console.log('ok    named clients sort ahead of randomized ones');
 
 			console.log(`\nPASS: ${out.querySelectorAll('.card').length} cards rendered with live values.`);
 			console.log(`      (${expect.length} values cross-checked against router fixture)`);

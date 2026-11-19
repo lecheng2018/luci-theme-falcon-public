@@ -33,6 +33,8 @@ var callWifiDevs  = rpc.declare({ object: 'iwinfo', method: 'devices',   expect:
 var callClientRates = rpc.declare({ object: 'luci.client-rates', method: 'get', params: [ 'addresses' ], expect: { '': {} } });
 var callLeases      = rpc.declare({ object: 'luci-rpc', method: 'getDHCPLeases', expect: { '': {} } });
 var callHostHints   = rpc.declare({ object: 'luci-rpc', method: 'getHostHints', expect: { '': {} } });
+/* 反查主机名：为没有 DHCP 租约/主机提示的客户端补名字 */
+var callRrdns       = rpc.declare({ object: 'network.rrdns', method: 'lookup', params: [ 'addrs', 'timeout', 'limit' ], expect: { '': {} } });
 /* hqos：厂商「客户端限速」引擎（luci-app-hqos），限速单位 kbps */
 var callQosState    = rpc.declare({ object: 'hqos', method: 'status', expect: { '': {} } });
 var callQosGet      = rpc.declare({ object: 'hqos', method: 'get', params: [ 'mac' ], expect: { '': {} } });
@@ -309,6 +311,50 @@ return view.extend({
 		return out;
 	},
 
+	/* 第二低比特为 1 表示本地管理地址——手机/平板的 MAC 随机化就是这个特征，
+	   这类设备不会有稳定主机名，强行显示「未命名」只会制造噪音。 */
+	isRandomMac: function(mac) {
+		var first = parseInt((mac || '').substr(0, 2), 16);
+		if (isNaN(first)) return false;
+		return (first & 0x02) !== 0;
+	},
+
+	/* 名称解析：租约/HostHints 已知的直接用；其余按 IP 反查一次并缓存。
+	   解析结果回来后触发一次列表重建。 */
+	resolveNames: function(clients) {
+		var self = this;
+		if (self.dnsBusy) return;
+		var want = [], seen = {};
+		clients.forEach(function(c) {
+			if (c.name) return;
+			c.ips.forEach(function(ip) {
+				if (ip.indexOf(':') >= 0) return;            /* rrdns 主要走 IPv4 */
+				if (self.dnsCache[ip] !== undefined || seen[ip]) return;
+				seen[ip] = 1;
+				want.push(ip);
+			});
+		});
+		if (!want.length) return;
+
+		self.dnsBusy = true;
+		L.resolveDefault(callRrdns(want.slice(0, 64), 3000, 64), {}).then(function (res) {
+			var got = false;
+			Object.keys(res || {}).forEach(function (ip) {
+				var name = res[ip];
+				if (name == null) return;
+				name = String(name).replace(/\.$/, '').trim();
+				if (!name || name === ip) return;
+				self.dnsCache[ip] = name;
+				got = true;
+			});
+			/* 查不到也记下，避免每次轮询重复请求 */
+			want.forEach(function (ip) { if (self.dnsCache[ip] === undefined) self.dnsCache[ip] = null; });
+			if (got && self.rebuildClientList) self.rebuildClientList();
+		}).catch(function () {
+			want.forEach(function (ip) { if (self.dnsCache[ip] === undefined) self.dnsCache[ip] = null; });
+		}).then(function () { self.dnsBusy = false; });
+	},
+
 	/* 组装客户端清单：DHCP 租约 ∪ conntrack 见过的 MAC ∪ HostHints ∪ 已配限速者 */
 	buildClientList: function() {
 		var self = this;
@@ -357,11 +403,38 @@ return view.extend({
 		});
 
 		var list = Object.keys(map).map(function(k) { return map[k]; });
+
+		list.forEach(function(c) {
+			/* 反查结果补齐名字 */
+			if (!c.name) {
+				for (var i = 0; i < c.ips.length; i++) {
+					var n = self.dnsCache && self.dnsCache[c.ips[i]];
+					if (n) { c.name = n; break; }
+				}
+			}
+			/* 仍然没名字的，标出随机 MAC，避免一排「未命名」 */
+			c.random = self.isRandomMac(c.mac);
+			c.display = c.name || (c.random ? '随机 MAC 设备' : '未知设备');
+		});
+
+		/* 过滤纯空闲条目：既无名称、又无流量、又无连接、也没配限速——
+		   这些是 conntrack 里的历史残留，留着只会淹没真正的设备。 */
+		list = list.filter(function(c) {
+			if (c.name || (self.qosLimits && self.qosLimits[c.mac])) return true;
+			var lv = self.live[c.mac];
+			if (!lv) return false;
+			return (lv.cumUp + lv.cumDown) > 0 || lv.conns > 0;
+		});
+
+		/* 排序：有名字的真实设备在前，随机 MAC / 未知在后；组内按实时流量 */
+		function rank(c) { return c.name ? 0 : (c.random ? 1 : 2); }
 		list.sort(function(a, b) {
+			var ra = rank(a), rb = rank(b);
+			if (ra !== rb) return ra - rb;
 			var la = self.live[a.mac] ? (self.live[a.mac].up + self.live[a.mac].down) : -1;
 			var lb = self.live[b.mac] ? (self.live[b.mac].up + self.live[b.mac].down) : -1;
 			if (lb !== la) return lb - la;
-			return (a.name || a.mac) > (b.name || b.mac) ? 1 : -1;
+			return (a.display || a.mac) > (b.display || b.mac) ? 1 : -1;
 		});
 		return list;
 	},
@@ -557,8 +630,7 @@ return view.extend({
 			[ '平均负载', (info.load || [ 0, 0, 0 ]).map(function(v) {
 				return (v / 65535).toFixed(2);
 			}).join(', ') ],
-			[ '连接数', (this.connTotal != null ? this.connTotal : '—') +
-				(this.connRouted ? '  ·  经路由 ' + this.connRouted : '') ],
+			[ '连接数', (this.connTotal != null ? this.connTotal : '—') ],
 			[ 'CPU 与硬件加速', cpuusage || '—' ]
 		];
 
@@ -927,7 +999,7 @@ return view.extend({
 					E('div', { 'class': 'client-head' }, [
 						E('div', { 'class': 'client-head-main' }, [
 							dotEl,
-							E('strong', { 'class': 'client-name' }, c.name || '(未命名设备)'),
+							E('strong', { 'class': 'client-name' }, c.display || c.name || '未知设备'),
 							E('span', { 'class': 'badge ' + (c.ips.length ? 'badge-success' : 'badge-orange') },
 								c.ips.length ? '在线' : '离线')
 						]),
@@ -956,6 +1028,9 @@ return view.extend({
 			});
 
 			paint();
+
+			/* 对没有名字的客户端做一次反查（结果回来后重建列表） */
+			self.resolveNames(clients);
 		}
 
 		/* 引擎行需要在状态变化时单独重绘 */
@@ -1048,6 +1123,10 @@ return view.extend({
 		self.qosLimits = {};
 		/* 在线设备：把 conntrack 结果归集到 MAC，并接手 load 里读到的规则 */
 		self.qosLimits = self.qosLimitsPre || {};
+		self.dnsCache = self.dnsCache || {};
+		/* buildClientList 读取 self.clientRates；必须与 state 同步，
+		   否则 conntrack 里那些没有租约/主机提示的设备不会进列表 */
+		self.clientRates = state.clientRates || {};
 		self.ingestClients(state.clientRates);
 
 		/* ── 动态接口发现（零硬编码）──────────────────────────────
@@ -1160,6 +1239,7 @@ return view.extend({
 				var ct = r[4] || {};
 				if (ct && ct.source === 'conntrack') {
 					state.clientRates = ct;
+					self.clientRates = ct;
 
 					var rt = self.ratesTotal(ct);
 					if (rt) {
