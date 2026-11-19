@@ -407,7 +407,7 @@ return view.extend({
 			};
 		});
 
-		/* conntrack 累计播种（精确口径主数据源，方案 E） */
+		/* conntrack 累计播种（精确吞吐主数据源） */
 		self.ctSamples = self.sumConntrack(self.clientRates, Date.now());
 
 		var host = E('div', { 'class': 'fx-root' });
@@ -526,7 +526,7 @@ return view.extend({
 			if (r[1]) self.cpuusage = r[1];
 			if (r[2]) self.pon = r[2];  /* 含 counters，供帧率估算 */
 
-			/* 精确口径（方案 E）：conntrack 累计差分 */
+			/* 精确口径：conntrack 累计差分 */
 			var ct = r[4] || {};
 			if (ct && ct.source === 'conntrack') {
 				var rt = self.ratesTotal(ct);

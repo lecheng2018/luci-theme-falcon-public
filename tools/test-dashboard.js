@@ -439,7 +439,7 @@ instance.load().then(data => {
 			}
 			console.log('ok    optical throughput tile went live on 2nd sample');
 
-			/* 方案 E 回归：conntrack 口径必须被采用并标注 */
+			/* 回归：conntrack 口径必须被采用并标注（不得回落成编造的估算值） */
 			if (!/全房合计（conntrack 记账）/.test(norm(t2))) {
 				console.log('FAIL: conntrack aggregate caption not adopted (plan E)');
 				process.exit(1);

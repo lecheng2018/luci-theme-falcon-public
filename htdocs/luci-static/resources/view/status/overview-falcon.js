@@ -653,10 +653,10 @@ return view.extend({
 		}
 
 		/* 吞吐口径优先级（精度递减）：
-		   ① conntrack 记账差分（方案 E，精确，含硬件卸载流量）——首选；
-		   ② WAN 三层设备/物理端口内核计数（未卸载时准确）；
-		   ③ XGEM 帧率 × MTU 估算（方案 B，兜底）。
-		   取三者最大值：只要任一口径看到流量都不会显示为 0。 */
+		   ① conntrack 记账（精确，含硬件卸载与 Wi-Fi 流量）——首选；
+		   ② WAN 物理端口 / 三层设备的内核计数器（未启用硬件卸载时准确）。
+		   取两者最大值：任一口径看到流量都不会误显示为 0。
+		   注意：不使用 XGEM 帧计数推算——PON 空闲帧与 PLOAM 会让它严重虚高。 */
 		var r1 = (this.wanDev && rates && rates[this.wanDev]) || {};
 		var r2 = (this.wanPortDev && rates && rates[this.wanPortDev]) || {};
 		var ct = this.ctRate || {};
@@ -1090,7 +1090,7 @@ return view.extend({
 			};
 		});
 
-		/* conntrack 累计播种（精确口径的主数据源，方案 E）：
+		/* conntrack 累计播种（精确吞吐的主数据源）：
 		   对 totals 求和得到全房流量累计，差分即真实 WAN 吞吐，
 		   不受 PPE 硬件卸载影响。 */
 		self.ctSamples = self.sumConntrack(state.clientRates, Date.now());
@@ -1150,7 +1150,7 @@ return view.extend({
 				if (r[2] && r[2].temps) state.wifiTemps = r[2].temps;
 
 
-				/* 精确口径（方案 E）：优先用厂商已平滑的 rates（按客户端 IP 求和）；
+				/* 精确口径：优先用厂商已平滑的 rates（按客户端 IP 求和）；
 				   rates 不可用时回退到累计值差分。均含硬件卸载流量。 */
 				var ct = r[4] || {};
 				if (ct && ct.source === 'conntrack') {
