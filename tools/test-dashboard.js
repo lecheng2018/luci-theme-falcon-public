@@ -517,6 +517,26 @@ instance.load().then(data => {
 		if (!/↑2000k/.test(norm(t2))) { console.log('FAIL: limit badge missing'); process.exit(1); }
 		console.log('ok    current limit badge rendered');
 
+		/* 系统卡必须显示整机连接数（conntrack 各 MAC 汇总） */
+		const connRow = /连接数/.test(norm(t2));
+		if (!connRow) {
+			console.log('FAIL: 连接数 row missing from the system card');
+			process.exit(1);
+		}
+		/* 夹具 connections 之和 = 12 + 3 + 756 = 771 */
+		if (!/连接数\s*5/.test(norm(t2))) {
+			const m = /连接数\D{0,12}/.exec(norm(t2));
+			console.log('FAIL: 连接数 total wrong, got: ' + (m ? m[0] : 'n/a'));
+			process.exit(1);
+		}
+		console.log('ok    整机连接数 rendered (5, summed from conntrack)');
+		if (!/经路由\s*4/.test(norm(t2))) {
+			const m = /经路由\D{0,12}/.exec(norm(t2));
+			console.log('FAIL: 经路由 count wrong, got: ' + (m ? m[0] : 'n/a'));
+			process.exit(1);
+		}
+		console.log('ok    经路由连接数 rendered (4)');
+
 		/* 端口并入光纤物理链路卡：不应再有独立的「网络」卡 */
 		const cardTitles = out.querySelectorAll('.card-title')
 			.map(n => (n.textContent || '').trim());
@@ -530,10 +550,45 @@ instance.load().then(data => {
 		}
 		console.log('ok    ports merged into the optical card (no standalone 网络 card)');
 		console.log('      cards: ' + cardTitles.join(' | '));
+
+		/* 回归：fill() 每次轮询都会重跑，在线设备卡必须跨轮次复用，
+		   否则用户正在输入的限速值会被 5 秒一次的刷新清空。 */
+		const inputEls = [];
+		(function walk(n) {
+			if (!n) return;
+			if (n.tagName === 'INPUT' && /client-limit-input/.test((n.attrs || {}).class || ''))
+				inputEls.push(n);
+			if (Array.isArray(n.children)) n.children.forEach(walk);
+		})(out);
+		if (!inputEls.length) {
+			console.log('FAIL: no limit inputs found to test persistence');
+			process.exit(1);
+		}
+		inputEls[0].attrs.value = '4321';
+
+		return polls[polls.length - 1]().then(function() {
+			const after = [];
+			(function walk(n) {
+				if (!n) return;
+				if (n.tagName === 'INPUT' && /client-limit-input/.test((n.attrs || {}).class || ''))
+					after.push(n);
+				if (Array.isArray(n.children)) n.children.forEach(walk);
+			})(out);
+			if (!after.length) {
+				console.log('FAIL: inputs disappeared after poll');
+				process.exit(1);
+			}
+			if (after[0] !== inputEls[0] || after[0].attrs.value !== '4321') {
+				console.log('FAIL: poll rebuilt the clients card and wiped the typed limit');
+				process.exit(1);
+			}
+			console.log('ok    typed limit survives a poll (clients card reused)');
+
 			console.log(`\nPASS: ${out.querySelectorAll('.card').length} cards rendered with live values.`);
 			console.log(`      (${expect.length} values cross-checked against router fixture)`);
 			console.log('PASS: byte counters produced real Mbps rates on the 2nd sample.');
 			process.exit(0);
+		});
 		});
 	}
 

@@ -394,6 +394,15 @@ return view.extend({
 			self.live[m].up += Number(v.upload || 0) * 8;
 			self.live[m].down += Number(v.download || 0) * 8;
 		});
+
+		/* 整机活动连接数：conntrack 按 MAC 汇总，相加即全部活动连接。
+		   routed_connections 只计经三层路由的条目（纯二层交换不计入）。 */
+		var routed = (rates && rates.routed_connections) || {};
+		var connSum = 0, routedSum = 0;
+		Object.keys(conns).forEach(function(m) { connSum += parseInt(conns[m], 10) || 0; });
+		Object.keys(routed).forEach(function(m) { routedSum += parseInt(routed[m], 10) || 0; });
+		self.connTotal = connSum;
+		self.connRouted = routedSum;
 	},
 
 	/* 从 rates[ip] 汇总当前速率（厂商已平滑）。
@@ -548,6 +557,8 @@ return view.extend({
 			[ '平均负载', (info.load || [ 0, 0, 0 ]).map(function(v) {
 				return (v / 65535).toFixed(2);
 			}).join(', ') ],
+			[ '连接数', (this.connTotal != null ? this.connTotal : '—') +
+				(this.connRouted ? '  ·  经路由 ' + this.connRouted : '') ],
 			[ 'CPU 与硬件加速', cpuusage || '—' ]
 		];
 
@@ -1025,7 +1036,7 @@ return view.extend({
 			wifiTemps: data[9],
 			allDev:   data[10] || {},
 			ifaceDump: Array.isArray(data[11]) ? data[11] : [],
-			clientRates: data[12] || {},
+			clientRates: data[19] || {},
 			hints:    data[20] || {},
 			qos:      data[21] || {}
 		};
@@ -1086,6 +1097,11 @@ return view.extend({
 		var host = E('div', { 'class': 'fx-root' });
 		var main = E('main', { 'class': 'luci-container' });
 
+		/* 在线设备卡只构建一次：fill() 每次轮询都会重跑（5 秒），
+		   若每轮重建就会把用户正在输入的限速值清空。该节点跨轮次复用，
+		   数字由 paintClientList 就地更新。 */
+		var clientsCard = null;
+
 		var fill = function() {
 			main.innerHTML = '';
 
@@ -1099,7 +1115,8 @@ return view.extend({
 
 			main.appendChild(self.cardOptical(state.pon, state.cpuinfo, self.rates, state.ports));
 
-			main.appendChild(self.cardClients());
+			if (!clientsCard) clientsCard = self.cardClients();
+			main.appendChild(clientsCard);
 
 			var wifi = self.cardWifi(state.wifi);
 			if (wifi) main.appendChild(wifi);
