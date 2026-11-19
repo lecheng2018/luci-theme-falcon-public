@@ -1,0 +1,7 @@
+/*
+ * luci-theme-falcon — mobile stylesheet compatibility stub
+ *
+ * All mobile and responsive layout rules are unified in theme.css under
+ * `@media (max-width: 854px)` and `@media (max-width: 640px)` for
+ * consistent, modern cascade ordering.
+ */
