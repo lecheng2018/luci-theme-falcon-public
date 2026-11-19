@@ -311,6 +311,20 @@ return view.extend({
 		return out;
 	},
 
+	/* 流量分载对统计的影响，如实呈现：
+	   分载开启时 Airoha PPE 把转发旁路内核，netdev 与 conntrack 都不再计数，
+	   界面上的速率会远低于真实值——这一点必须写在明面上。 */
+	flowSummary: function() {
+		if (!this.offload) return '—';
+		if (this.flowAccurate)
+			return E('span', { 'class': 'badge badge-success' }, '精确');
+		return E('span', {}, [
+			E('span', { 'class': 'badge badge-orange' }, '受限'),
+			E('span', { 'style': 'font-size:11px;color:#b45309;margin-left:6px' },
+				'流量分载已开启，速率会明显偏低')
+		]);
+	},
+
 	/* 第二低比特为 1 表示本地管理地址——手机/平板的 MAC 随机化就是这个特征，
 	   这类设备不会有稳定主机名，强行显示「未命名」只会制造噪音。 */
 	isRandomMac: function(mac) {
@@ -557,7 +571,18 @@ return view.extend({
 					L.resolveDefault(callHostHints(), {}),
 					L.resolveDefault(callQosState(), {})
 				]);
-			})
+			}),
+			/* [13] 流量分载开关：决定流量计数是否可信。
+			   Airoha PPE 会把分载的流转发旁路内核，netdev 与 conntrack 同时停止
+			   计数——实测偏差可达 1000 倍，因此必须在界面上说清楚。 */
+			L.require('uci').then(function(uci) {
+				return L.resolveDefault(uci.load('firewall'), null).then(function() {
+					return {
+						sw: uci.get('firewall', '@defaults[0]', 'flow_offloading') === '1',
+						hw: uci.get('firewall', '@defaults[0]', 'flow_offloading_hw') === '1'
+					};
+				});
+			}).catch(function() { return null; })
 		]).then(function(r) {
 			/* 把租约批次里的三个结果摊平进同一个数组，保持既有索引不变 */
 			var tail = r[12] || [];
@@ -631,6 +656,7 @@ return view.extend({
 				return (v / 65535).toFixed(2);
 			}).join(', ') ],
 			[ '连接数', (this.connTotal != null ? this.connTotal : '—') ],
+			[ '流量统计', this.flowSummary() ],
 			[ 'CPU 与硬件加速', cpuusage || '—' ]
 		];
 
@@ -1112,6 +1138,7 @@ return view.extend({
 			allDev:   data[10] || {},
 			ifaceDump: Array.isArray(data[11]) ? data[11] : [],
 			clientRates: data[19] || {},
+			offload:  data[13] || null,
 			hints:    data[20] || {},
 			qos:      data[21] || {}
 		};
@@ -1127,6 +1154,8 @@ return view.extend({
 		/* buildClientList 读取 self.clientRates；必须与 state 同步，
 		   否则 conntrack 里那些没有租约/主机提示的设备不会进列表 */
 		self.clientRates = state.clientRates || {};
+		self.offload = state.offload;
+		self.flowAccurate = !(state.offload && (state.offload.sw || state.offload.hw));
 		self.ingestClients(state.clientRates);
 
 		/* ── 动态接口发现（零硬编码）──────────────────────────────

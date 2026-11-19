@@ -54,6 +54,8 @@ fixture.hints = {
 	'AA:BB:CC:DD:EE:02': { ipaddrs: [ '10.0.0.12' ], name: 'host-b' },   /* pii-scan:ignore 测试假数据 */
 	'AA:BB:CC:DD:EE:09': { ipaddrs: [ '10.0.0.19' ], name: 'nas' }       /* pii-scan:ignore 测试假数据 */
 };
+/* 分载关闭（用户路由器实测配置）：流量统计应标为「精确」 */
+fixture.firewall = { flow_offloading: '0', flow_offloading_hw: '0', flow_offloading_hw_ipv6: '0' };
 fixture.qosState = { enabled: true, running: true, backend: 'airoha',
 	configured_clients: 1, supported: true, kernel: '5.4.302' };
 fixture.qosLimits = {
@@ -254,7 +256,10 @@ const L = {
 		});
 		if (dep === 'view') return Promise.resolve({ extend: o => o });
 		if (dep === 'ui') return Promise.resolve({});
-		if (dep === 'uci') return Promise.resolve({ load: () => Promise.resolve() });
+		if (dep === 'uci') return Promise.resolve({
+			load: () => Promise.resolve(),
+			get: (pkg, sec, opt) => (fixture.firewall || {})[opt]
+		});
 		return Promise.resolve({});
 	}
 };
@@ -285,7 +290,10 @@ sandbox.view = { extend: o => o };
 sandbox.rpc = makeRpc();
 sandbox.poll = { add(fn) { polls.push(fn); }, start() {} };
 sandbox.ui = {};
-sandbox.uci = { load: () => Promise.resolve() };
+sandbox.uci = {
+	load: () => Promise.resolve(),
+	get: (pkg, sec, opt) => (fixture.firewall || {})[opt]
+};
 sandbox.fs = {
 	exec(cmd) {
 		if (cmd === '/usr/sbin/ponctl')
@@ -608,6 +616,31 @@ instance.load().then(data => {
 			process.exit(1);
 		}
 		console.log('ok    named clients sort ahead of randomized ones');
+
+		/* 流量统计口径必须如实标注：分载关闭 = 精确 */
+		if (!/流量统计/.test(norm(t2))) {
+			console.log('FAIL: 流量统计 row missing');
+			process.exit(1);
+		}
+		console.log('ok    流量统计 row present');
+		if (!/精确/.test(norm(t2))) {
+			console.log('FAIL: with offload disabled the row should read 精确');
+			process.exit(1);
+		}
+		console.log('ok    offload disabled -> 精确');
+
+		/* 反向：分载开启时必须标「受限」并给出解释，不能继续假装精确 */
+		fixture.firewall = { flow_offloading: '1', flow_offloading_hw: '1', flow_offloading_hw_ipv6: '1' };
+		instance.offload = { sw: true, hw: true };
+		instance.flowAccurate = false;
+		const warnTxt = instance.flowSummary();
+		const warnStr = typeof warnTxt === 'string' ? warnTxt : (warnTxt.textContent || '');
+		if (!/受限/.test(warnStr) || !/偏低/.test(warnStr)) {
+			console.log('FAIL: offload enabled must render 受限 + explanation, got: ' + warnStr);
+			process.exit(1);
+		}
+		console.log('ok    offload enabled -> 受限（明确说明速率偏低）');
+		fixture.firewall = { flow_offloading: '0', flow_offloading_hw: '0', flow_offloading_hw_ipv6: '0' };
 
 			console.log(`\nPASS: ${out.querySelectorAll('.card').length} cards rendered with live values.`);
 			console.log(`      (${expect.length} values cross-checked against router fixture)`);

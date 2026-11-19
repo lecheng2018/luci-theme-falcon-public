@@ -31,7 +31,8 @@
 			},
 			"uci": [
 				"hqos",
-				"network"
+				"network",
+				"firewall"
 			]
 		},
 		"write": {
