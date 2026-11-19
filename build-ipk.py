@@ -12,10 +12,31 @@ import tarfile
 
 BASE = os.path.abspath(os.path.dirname(__file__))
 PKG = "luci-theme-falcon"
-VERSION = "1.4.8"
+VERSION = "1.4.9"
 RELEASE = "1"
 ARCH = "all"
 OUT_NAME = f"{PKG}_{VERSION}-{RELEASE}_{ARCH}.ipk"
+
+# LuCI 给视图 JS 加的缓存键只跟 LuCI 自身版本走，换主题文件时 URL 不变，
+# 浏览器会一直吃旧缓存。把版本号写进文件名即可强制换 URL。
+REV = VERSION.replace(".", "_")
+
+
+def versioned(path):
+    """status/overview-falcon -> status/overview-falcon_1_4_9"""
+    return f"{path}_{REV}"
+
+
+# 构建时对文本文件做的替换（源文件保持干净，包内才是改过的）
+TRANSFORM = {
+    "root/usr/share/luci/menu.d/zz-luci-theme-falcon.json": [
+        ("status/overview-falcon", versioned("status/overview-falcon")),
+        ("status/topology-falcon", versioned("status/topology-falcon")),
+    ],
+    "ucode/template/themes/falcon/sysauth.ut": [
+        ("'falcon.sysauth'", f"'falcon.sysauth_{REV}'"),
+    ],
+}
 
 # source path -> install path inside the rootfs
 FILES = [
@@ -25,9 +46,9 @@ FILES = [
 	("htdocs/luci-static/falcon/cascade.css", "www/luci-static/falcon/cascade.css", 0o644),
 	("htdocs/luci-static/falcon/mobile.css", "www/luci-static/falcon/mobile.css", 0o644),
 	("htdocs/luci-static/falcon/theme.css", "www/luci-static/falcon/theme.css", 0o644),
-	("htdocs/luci-static/resources/view/status/overview-falcon.js", "www/luci-static/resources/view/status/overview-falcon.js", 0o644),
-	("htdocs/luci-static/resources/view/status/topology-falcon.js", "www/luci-static/resources/view/status/topology-falcon.js", 0o644),
-    ("htdocs/luci-static/resources/view/falcon/sysauth.js", "www/luci-static/resources/view/falcon/sysauth.js", 0o644),
+	("htdocs/luci-static/resources/view/status/overview-falcon.js", f"www/luci-static/resources/view/status/overview-falcon_{REV}.js", 0o644),
+	("htdocs/luci-static/resources/view/status/topology-falcon.js", f"www/luci-static/resources/view/status/topology-falcon_{REV}.js", 0o644),
+    ("htdocs/luci-static/resources/view/falcon/sysauth.js", f"www/luci-static/resources/view/falcon/sysauth_{REV}.js", 0o644),
     ("root/usr/libexec/falcon-wifi-temp", "usr/libexec/falcon-wifi-temp", 0o755),
     ("root/usr/share/rpcd/acl.d/luci-theme-falcon.json",
      "usr/share/rpcd/acl.d/luci-theme-falcon.json", 0o644),
@@ -108,6 +129,8 @@ def main():
             raise SystemExit(f"missing source file: {src}")
         with open(full, "rb") as fh:
             data = fh.read()
+        for old_text, new_text in TRANSFORM.get(src, ()):
+            data = data.replace(old_text.encode(), new_text.encode())
         total += len(data)
         entries.append((dst, data, mode))
 

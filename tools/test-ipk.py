@@ -75,6 +75,28 @@ def main():
                 fail(f'control 缺少字段 {field}')
     print('ok    control.tar.gz (control + postinst + prerm, 关键字段齐全)')
 
+    # 缓存键回归：视图 JS 必须带版本后缀，且菜单/模板路径与之匹配
+    import re
+    ver = re.search(r'luci-theme-falcon_(\d+)\.(\d+)\.(\d+)-', os.path.basename(pkg))
+    if ver:
+        rev = '_'.join(ver.groups())
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as dd2:
+            data_names = [m.name for m in dd2.getmembers() if m.isfile()]
+        views = [n for n in data_names if '/view/' in n and n.endswith('.js')]
+        bad = [n for n in views if not re.search(r'_\d+_\d+_\d+\.js$', n)]
+        if bad:
+            fail('视图文件缺少版本后缀（会命中浏览器缓存）: ' + ', '.join(bad))
+        menu = None
+        with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as dd:
+            for m in dd.getmembers():
+                if m.name.endswith('zz-luci-theme-falcon.json'):
+                    menu = dd.extractfile(m).read().decode()
+        if menu:
+            for path in re.findall(r'"path"\s*:\s*"([^"]+)"', menu):
+                if not path.endswith('_' + rev):
+                    fail(f'菜单路径未带版本后缀: {path}（期望以 _{rev} 结尾）')
+            print(f'ok    视图文件与菜单路径均带版本后缀 _{rev}（强制刷新浏览器缓存）')
+
     print('\nPASS: IPK 结构正确，可安全安装')
 
 if __name__ == '__main__':
