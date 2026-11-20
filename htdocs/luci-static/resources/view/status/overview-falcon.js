@@ -151,7 +151,7 @@ function card(title, body) {
 function progressRow(label, valueText, percent, fill) {
 	return E('div', { 'class': 'progress-bar-container' }, [
 		E('div', { 'class': 'progress-label-row' }, [
-			E('span', { style: 'color:#6b7280' }, label),
+			E('span', { style: 'color:var(--text-muted);font-weight:500' }, label),
 			E('span', { style: 'font-weight:500' }, valueText)
 		]),
 		E('div', { 'class': 'progress-track' }, E('div', {
@@ -876,7 +876,7 @@ return view.extend({
 				]),
 				up ? E('div', { 'class': 'iface-stats' },
 					E('div', {}, [
-						E('span', { style: 'color:#6b7280;font-size:11px' }, '本口实时（不含 Wi-Fi）'),
+						E('span', { style: 'color:var(--text-muted);font-size:12px' }, '本口实时（不含 Wi-Fi）'),
 						E('br'),
 						E('strong', {}, '↑ ' + rate(d.up) + ' · ↓ ' + rate(d.down))
 					])) : ''
@@ -979,7 +979,7 @@ return view.extend({
 						var down = parseInt(downIn.value, 10) || 0;
 						var cn = parseInt(connIn.value, 10) || 0;
 						msg.textContent = '保存中…';
-						msg.style.color = '#6b7280';
+						msg.style.color = 'var(--text-muted)';
 
 						return callQosSet({ mac: c.mac, name: c.name || '',
 							upload: up, download: down, connections: cn
@@ -1103,7 +1103,7 @@ return view.extend({
 			if (clients.length) {
 				kids.push(E('div', { 'class': 'iface-stats' },
 					E('div', {}, [
-						E('span', { style: 'color:#6b7280;font-size:11px' }, '信号最强'),
+						E('span', { style: 'color:var(--text-muted);font-size:12px' }, '信号最强'),
 						E('br'),
 						E('strong', {}, (function() {
 							var best = clients.reduce(function(a, b) {

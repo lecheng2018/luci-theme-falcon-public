@@ -2397,7 +2397,8 @@ select:focus,
 	.fx-root .info-table td.key {
 		width: 78px !important;
 		min-width: 78px !important;
-		color: #6b7280 !important;
+		color: var(--text-muted) !important;
+		font-weight: 500 !important;
 	}
 
 	.fx-root .info-table td.val {
@@ -2837,6 +2838,7 @@ select:focus,
 
 .fx-root .info-table td.key {
   color: var(--text-muted);
+  font-weight: 500;
   width: 30%;
 }
 
@@ -3638,7 +3640,7 @@ select:focus,
 
 .fx-root .client-limit-row small {
   font-size: 11px;
-  color: #9ca3af;
+  color: var(--text-muted);
 }
 
 .fx-root .client-limit-actions {
@@ -3718,7 +3720,8 @@ select:focus,
 }
 
 .fx-root .port-strip .iface-meta > span {
-  font-size: 11px;
+  font-size: 12px;
+  color: var(--text-muted);
   line-height: 1.5;
 }
 
