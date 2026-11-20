@@ -79,7 +79,7 @@ check('mobile header block does not set fixed height',
 console.log('\n5. stylesheet integrity');
 const { execSync } = require('child_process');
 try {
-	execSync('node ' + path.join(__dirname, 'check-css.js'), { stdio: 'pipe' });
+	execSync('"' + process.execPath + '" "' + path.join(__dirname, 'check-css.js') + '"', { stdio: 'pipe' });
 	console.log('  ok    theme.css is flat, valid CSS');
 } catch (e) {
 	fails++;
@@ -144,6 +144,25 @@ check('sidebar keeps 概览 → 整机详情（在线设备并入概览页）',
 const portMedia = [...css.matchAll(/@media \(max-width:\s*640px\)\s*\{([\s\S]*?)\n\}/g)]
 	.map(m => m[1]).find(b => /port-strip/.test(b));
 check('port strip has a <=640px rule', !!portMedia);
+
+check('topology viewport supports bounded scrolling', /\.topology-viewport\s*\{[^}]*overflow:\s*auto/.test(css));
+check('topology SVG has no fixed minimum width', !/\.fx-root \.topology-svg\s*\{[^}]*min-width\s*:\s*900px/.test(css));
+check('topology SVG scales proportionally', /\.fx-root \.topology-svg\s*\{[^}]*height:\s*auto/.test(css));
+
+const logRules = css.match(/body\[data-page="admin-status-(?:syslog|dmesg)"\][^{]+\{[^}]*\}/g) || [];
+const logCss = logRules.join('\n');
+check('syslog and dmesg use page-scoped output rules',
+	logCss.includes('overflow-wrap: anywhere') && /overflow:\s*auto/.test(logCss));
+check('log output has responsive viewport height',
+	/height:\s*min\(70vh,\s*720px\)/.test(logCss) && /56dvh/.test(css));
+check('mobile log buttons meet touch target size',
+	/\[data-page="admin-status-syslog"\] \.cbi-page-actions \.btn[\s\S]*?min-height:\s*44px/.test(css));
+
+const irq = findRule(/\.irq-row$/).filter(r => !r.media);
+check('port traffic rows use fixed name/bar/rate columns', irq.some(r =>
+	/grid-template-columns\s*:\s*70px\s+minmax\(0,\s*1fr\)\s+82px/.test(r.body)),
+	'port rows must keep the progress tracks aligned');
+
 if (portMedia) {
 	check('port strip collapses to one column on narrow screens',
 		/\.port-strip\s*\{[^}]*grid-template-columns:\s*1fr/.test(portMedia),

@@ -18,6 +18,11 @@ const vm = require('vm');
 const FIXTURE_PATH = process.env.FALCON_FIXTURE
 	|| path.join(__dirname, 'fixture.example.json');
 const fixture = JSON.parse(fs.readFileSync(FIXTURE_PATH, 'utf8'));
+fixture.firewall = { flow_offloading: '1', flow_offloading_hw: '1', flow_offloading_hw_ipv6: '0' };
+fixture.hints = {
+	'AA:BB:CC:DD:EE:01': { ipaddrs: [ '10.0.0.11' ], ip6addrs: [ '2001:db8::11' ] }
+};
+fixture.rateRequests = [];
 fixture.dev = fixture.dev || {};
 fixture.dev.pon0 = { statistics: { rx_bytes: 9_837_451_075, tx_bytes: 19_086_178_927 } };
 fixture.dev['pon0.66'] = { statistics: { rx_bytes: 7_379_290_676, tx_bytes: 17_336_316_781 } };
@@ -173,8 +178,10 @@ function makeRpc() {
 				else if (key === 'luci.getCPUBench') raw = fixture.cpubench;
 				else if (key === 'network.interface.dump') raw = fixture.ifaceDump;
 				else if (key === 'luci.getBuiltinEthernetPorts') raw = fixture.ports;
-				else if (key === 'luci-rpc.getDHCPLeases') raw = fixture.leases;
+		else if (key === 'luci-rpc.getDHCPLeases') raw = fixture.leases;
+		else if (key === 'luci-rpc.getHostHints') raw = fixture.hints;
 				else if (spec.object === 'luci.client-rates' && spec.method === 'get') {
+					fixture.rateRequests.push(Array.isArray(args[0]) ? args[0].slice() : []);
 					Object.keys(fixture.clientRates.traffic).forEach(mac => {
 						fixture.clientRates.traffic[mac].upload += 500_000;
 						fixture.clientRates.traffic[mac].download += 2_500_000;
@@ -227,10 +234,14 @@ const L = {
 				return Promise.resolve({ code: 127 });
 			}
 		});
-		if (dep === 'poll') return Promise.resolve({
-			add(fn) { polls.push(fn); }, start() {}
-		});
-		return Promise.resolve({});
+			if (dep === 'poll') return Promise.resolve({
+				add(fn) { polls.push(fn); }, start() {}
+			});
+			if (dep === 'uci') return Promise.resolve({
+				load: () => Promise.resolve(),
+				get: (pkg, sec, opt) => (fixture.firewall || {})[opt]
+			});
+			return Promise.resolve({});
 	}
 };
 const polls = [];
@@ -288,6 +299,14 @@ function runAssertions(host) {
 		fails.push('expected ' + expectedRows + ' port traffic rows (dynamic builtin ports)');
 	if (host.querySelectorAll('.vpe-block').length !== 3)
 		fails.push('expected 3 interface blocks');
+	if (host.querySelectorAll('.topology-zoom-tools').length !== 1)
+		fails.push('topology zoom controls missing');
+		if (host.querySelectorAll('.topology-legend').length !== 0)
+		fails.push('redundant topology legend should be removed');
+		if (!host.querySelectorAll('.vpe-block-pon').some(function(n) {
+			return (n.attrs.class || '').split(/\s+/).includes('is-connected');
+		}))
+			fails.push('O5 PON block should use the connected state');
 
 	/* 2. 拓扑 SVG（通过 innerHTML 日志断言） */
 	for (const marker of ['Airoha AN7581 Quad-Core SoC', 'BOSA 光器件', 'XGTC', 'PPE / HWNAT', 'Switch / PHY']) {
@@ -305,7 +324,11 @@ function runAssertions(host) {
 		if (!text.includes(marker)) fails.push('page text missing: ' + marker);
 	}
 	const modT = fixture.pon.frontend.temperature_celsius.toFixed(1);
-	if (!text.includes(modT)) fails.push('module temperature missing from tiles');
+			if (!text.includes(modT)) fails.push('module temperature missing from tiles');
+			if (!svgAll.includes('data-bind="offload"')) fails.push('offload status binding missing');
+			if (!svgAll.includes('data-bind="wanname"')) fails.push('WAN source binding missing');
+			if (!fixture.rateRequests.some(a => a.includes('2001:db8::11')))
+				fails.push('IPv6 HostHint was not sent to client-rates');
 
 	if (fails.length) {
 		console.log('FAIL:');
@@ -320,18 +343,46 @@ function runAssertions(host) {
 
 	/* 5. 第二次轮询：吞吐行出现真实速率 */
 	if (polls.length) {
-		return polls[0]().then(() => {
-			const rowText = Array.from(host.querySelectorAll('.irq-row'))
-				.map(r => r.textContent).join(' ');
-			if (!/↓ [\d.]+ Mbps/.test(rowText)) {
-				console.log('FAIL: port traffic rows never went live:', rowText);
+			return polls[0]().then(function() {
+				const rowText = Array.from(host.querySelectorAll('.irq-row'))
+					.map(r => r.textContent).join(' ');
+				if (!/↓ [\d.]+ Mbps/.test(rowText))
+					throw new Error('port traffic rows never went live: ' + rowText);
+				if (!instance.offload || !instance.offload.known || !instance.offload.sw)
+					throw new Error('enabled flow offload status was not loaded');
+				if (!fixture.rateRequests.some(a => a.includes('2001:db8::11')))
+					throw new Error('IPv6 HostHint was not sent to client-rates');
+				if (!svgAll.includes('data-bind="wanname"') || instance.wanDev !== 'pppoe-wan')
+					throw new Error('WAN topology counter source not identified');
+				const unitProbe = instance.rateTotal({ source: 'conntrack', incomplete: false,
+					rates: { probe: { ready: true, upload: 1000000, download: 250000 } } });
+				if (!unitProbe || unitProbe.up !== 8000000 || unitProbe.down !== 2000000)
+					throw new Error('topology B/s unit conversion is wrong');
+				return instance.refreshAll(false);
+			}).then(function() {
+				fixture.pon.registration.onu_state = 'O1';
+				return instance.refreshAll(false);
+			}).then(function() {
+				if (host.querySelectorAll('.vpe-block-pon').some(function(n) {
+					return (n.attrs.class || '').split(/\s+/).includes('is-connected');
+				})) throw new Error('disconnected PON retained connected styling');
+				fixture.pon.registration.onu_state = 'O5';
+				return instance.refreshAll(false);
+			}).then(function() {
+				fixture.pon = null;
+				return instance.refreshAll(false);
+			}).then(function() {
+				if (host.querySelectorAll('.vpe-block-pon').some(function(n) {
+					return (n.attrs.class || '').split(/\s+/).includes('is-connected');
+				})) throw new Error('PON read failure retained connected styling');
+				console.log('ok    topology throughput, offload, IPv6, units and PON state transitions');
+				console.log('');
+				console.log('PASS: topology page renders with live data.');
+				process.exit(0);
+			}).catch(e => {
+				console.error('FAIL: topology refresh:', e.message);
 				process.exit(1);
-			}
-			console.log('ok    port traffic went live on 2nd sample');
-			console.log('');
-			console.log('PASS: topology page renders with live data.');
-			process.exit(0);
-		});
+			});
 	}
 
 	console.log('');
