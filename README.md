@@ -40,20 +40,15 @@ div.cbi-section
   div                  ← 内容
 ```
 
-数据来源与刷新方式：
-
-- 通过 `fs.exec('/usr/sbin/ponctl', ['--device', 'pon0', 'status', '--json'])` 读取驱动上报；
-- 注册到 LuCI 自己的 `poll` 周期（5 秒），与其他概览区块同步刷新；
-- 上下行速率由 `xgem_rx` / `xgem_tx` 计数器两次采样差分得出，
-  首次刷新显示 `—`，之后才是真实速率。
-
-卡片展示项：PON 注册状态、接收光功率（含 -28 ~ -8 dBm 渐变标尺）、发送光功率与偏置、
-光前端温度、物理光路模式与同步状态、实时链路吞吐。
+- 上下行速率取自 `network.device status()` 的单个 WAN 设备 `rx_bytes` / `tx_bytes` 计数，两次采样差分后换算为 bit/s；显示的来源设备会在页面标明。
+- 客户端速率取自厂商 `luci.client-rates` RPC。它是内核已记录的客户端样本，不保证包含被 PPE 硬件卸载的流量；页面不会将它与 WAN 设备计数拼成所谓的整机总速率。
+- UCI 中的 `flow_offloading`、`flow_offloading_hw`、`flow_offloading_hw_ipv6` 仅用于提示配置状态，不是硬件计数准确性的证明。分载开启时内核计数可能漏计；关闭时也不声称未经实测的绝对精确。
+- 不使用 XGEM 帧计数估算业务字节速率；PON 空闲帧/PLOAM 会造成虚高。
 
 ## 构建
 
 ```sh
-python3 build-ipk.py          # → dist/luci-theme-falcon_1.1.0-1_all.ipk
+python3 build-ipk.py          # → dist/luci-theme-falcon_1.5.5-1_all.ipk
 ```
 
 生成的是标准 OpenWrt `.ipk`（外层 gzip tar，内含 `debian-binary` /
@@ -62,7 +57,7 @@ python3 build-ipk.py          # → dist/luci-theme-falcon_1.1.0-1_all.ipk
 ## 安装
 
 ```sh
-opkg install luci-theme-falcon_1.1.0-1_all.ipk
+opkg install luci-theme-falcon_1.5.5-1_all.ipk
 ```
 
 安装脚本会写入 `luci.themes.Falcon` 并把 `luci.main.mediaurlbase` 指向
@@ -98,11 +93,10 @@ node tools/test-card.js
 | 指标 | 来源 | 备注 |
 | :--- | :--- | :--- |
 | 光功率 / 温度 / 偏置 / ONU 状态 / 模式 | `ponctl --device pon0 status --json` | 驱动直读 |
-| 上下行速率 | `network.device status('pon0').statistics` 的 `rx_bytes` / `tx_bytes` | 两次采样差分 ×8 ÷ 时长 |
+| WAN 上下行实时速率 | `network.device status()` 的 WAN 设备 `rx_bytes` / `tx_bytes` | 单一设备采样差分 ×8 ÷ 时长；PPE 卸载可能使内核计数不完整 |
+| 客户端实时速率/累计量 | `luci.client-rates.get(addresses)` | 已记录客户端数据；只有后端硬件统计实际生效时才能覆盖 PPE 流量 |
 
-速率**不使用** `ponctl` 的 `counters.xgem_rx` / `xgem_tx`：那是 GEM **帧**计数，
-不是字节数，换算成 bit/s 是错误的。也**不使用** `fs.read('/sys/...')`，
-因为默认 ACL 不放行该路径。
+`flow_offloading` / `flow_offloading_hw` / `flow_offloading_hw_ipv6` 仅表示配置，不证明统计完整。`ponctl` 的 `counters.xgem_rx` / `xgem_tx` 是 GEM 帧计数，不能换算为业务字节速率。
 
 ## 自行验证（无需路由器）
 

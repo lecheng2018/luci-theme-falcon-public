@@ -418,8 +418,8 @@ instance.load().then(data => {
 	console.log('ok    dual temperature rendered:', modT, '/', ct && ct[1]);
 
 	/* 预览的六个指标 caption 必须逐字存在 */
-	['PON 注册状态', '接收光功率 ·', '发送光功率', '整机与芯片温度',
-	 '物理光路与模式', '实时光链路吞吐'].forEach(function(cap) {
+['PON 注册状态', '接收光功率 ·', '发送光功率', '整机与芯片温度',
+			 '物理光路与模式', '实时 WAN 吞吐'].forEach(function(cap) {
 		if (norm(text).indexOf(cap) < 0) {
 			console.log('FAIL: preview metric caption missing:', cap);
 			process.exit(1);
@@ -449,22 +449,36 @@ instance.load().then(data => {
 		}
 		return polls[0]().then(() => {
 			const t2 = out.textContent.replace(/\s+/g, ' ');
-			const m = /实时光链路吞吐[^物]*↓ ([\d.]+) Mbps/.exec(t2);
-			console.log('\n--- after 2nd poll ---');
-			console.log(m ? m[0] : '(no rate found)');
-			if (!m) {
-				console.log('FAIL: optical throughput did not render an Mbps rate' +
-					(m ? '' : ''));
-				process.exit(1);
-			}
-			console.log('ok    optical throughput tile went live on 2nd sample');
+				const m = /实时 WAN 吞吐[^流]*↓ ([\d.]+) Mbps/.exec(t2);
+				console.log('\n--- after 2nd poll ---');
+				console.log(m ? m[0] : '(no WAN rate found)');
+				if (!m) {
+					console.log('FAIL: WAN throughput did not render an Mbps rate');
+					process.exit(1);
+				}
+				console.log('ok    WAN device throughput went live on 2nd sample');
 
-			/* 回归：conntrack 口径必须被采用并标注（不得回落成编造的估算值） */
-			if (!/全房合计（conntrack 记账）/.test(norm(t2))) {
-				console.log('FAIL: conntrack aggregate caption not adopted (plan E)');
-				process.exit(1);
-			}
-			console.log('ok    conntrack aggregate caption adopted (plan E)');
+				/* WAN 速率必须标明单一设备来源，不能把 conntrack 与网卡计数取最大混合。 */
+				if (!/设备计数：pppoe-wan/.test(norm(t2))) {
+					console.log('FAIL: WAN throughput source is not identified as pppoe-wan');
+					process.exit(1);
+				}
+				if (/全房合计（conntrack 记账）|含 Wi-Fi 与硬件卸载/.test(norm(t2))) {
+					console.log('FAIL: WAN throughput still claims complete hardware-offload accounting');
+					process.exit(1);
+				}
+				console.log('ok    WAN throughput uses one identified device source');
+
+				/* rates 的默认 B/s 口径只转换一次：1,000,000 B/s = 8 Mbps。 */
+				const unitProbe = instance.ratesTotal({
+					source: 'conntrack', incomplete: false,
+					rates: { probe: { ready: true, upload: 1000000, download: 250000 } }
+				});
+				if (!unitProbe || unitProbe.up !== 8000000 || unitProbe.down !== 2000000) {
+					console.log('FAIL: client rate unit conversion is wrong:', unitProbe);
+					process.exit(1);
+				}
+				console.log('ok    client rates convert B/s to bit/s exactly once');
 
 			/* 方向语义回归：LAN 口必须按客户端视角显示（收/发），
 			   且实时吞吐标签须注明不含 Wi-Fi，避免与光链路总吞吐混淆。 */
@@ -617,30 +631,32 @@ instance.load().then(data => {
 		}
 		console.log('ok    named clients sort ahead of randomized ones');
 
-		/* 流量统计口径必须如实标注：分载关闭 = 精确 */
-		if (!/流量统计/.test(norm(t2))) {
-			console.log('FAIL: 流量统计 row missing');
-			process.exit(1);
-		}
-		console.log('ok    流量统计 row present');
-		if (!/精确/.test(norm(t2))) {
-			console.log('FAIL: with offload disabled the row should read 精确');
-			process.exit(1);
-		}
-		console.log('ok    offload disabled -> 精确');
+			/* 流量统计显示配置状态，而不是未经硬件验证的「精确」。 */
+			if (!/流量统计/.test(norm(t2))) {
+				console.log('FAIL: 流量统计 row missing');
+				process.exit(1);
+			}
+			if (!/配置未启用分载/.test(norm(t2))) {
+				console.log('FAIL: disabled offload should report configuration status');
+				process.exit(1);
+			}
+			if (/流量统计\s*精确/.test(norm(t2))) {
+				console.log('FAIL: UI still claims exact accounting');
+				process.exit(1);
+			}
+			console.log('ok    offload disabled -> configuration status, not exactness');
 
-		/* 反向：分载开启时必须标「受限」并给出解释，不能继续假装精确 */
-		fixture.firewall = { flow_offloading: '1', flow_offloading_hw: '1', flow_offloading_hw_ipv6: '1' };
-		instance.offload = { sw: true, hw: true };
-		instance.flowAccurate = false;
-		const warnTxt = instance.flowSummary();
-		const warnStr = typeof warnTxt === 'string' ? warnTxt : (warnTxt.textContent || '');
-		if (!/受限/.test(warnStr) || !/偏低/.test(warnStr)) {
-			console.log('FAIL: offload enabled must render 受限 + explanation, got: ' + warnStr);
-			process.exit(1);
-		}
-		console.log('ok    offload enabled -> 受限（明确说明速率偏低）');
-		fixture.firewall = { flow_offloading: '0', flow_offloading_hw: '0', flow_offloading_hw_ipv6: '0' };
+			/* 三项开关任一开启都要提示可能漏计，包括 IPv6 硬件卸载。 */
+			fixture.firewall = { flow_offloading: '0', flow_offloading_hw: '0', flow_offloading_hw_ipv6: '1' };
+			instance.offload = { known: true, sw: false, hw: false, hw6: true };
+			const warnTxt = instance.flowSummary();
+			const warnStr = typeof warnTxt === 'string' ? warnTxt : (warnTxt.textContent || '');
+			if (!/已配置分载/.test(warnStr) || !/可能漏计/.test(warnStr)) {
+				console.log('FAIL: IPv6 offload must report possible missing hardware traffic, got: ' + warnStr);
+				process.exit(1);
+			}
+			console.log('ok    IPv6 hardware offload is included in the warning');
+			fixture.firewall = { flow_offloading: '0', flow_offloading_hw: '0', flow_offloading_hw_ipv6: '0' };
 
 			console.log(`\nPASS: ${out.querySelectorAll('.card').length} cards rendered with live values.`);
 			console.log(`      (${expect.length} values cross-checked against router fixture)`);
