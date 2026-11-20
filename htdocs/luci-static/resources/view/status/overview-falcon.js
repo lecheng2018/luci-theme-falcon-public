@@ -28,8 +28,7 @@ var callIfaceDump = rpc.declare({ object: 'network.interface', method: 'dump', e
 /* 无参调用一次返回全部设备（含统计计数），替代逐设备轮询：单次 RPC 覆盖所有接口 */
 var callDevStatusAll = rpc.declare({ object: 'network.device', method: 'status', expect: { '': {} } });
 var callWifiDevs  = rpc.declare({ object: 'iwinfo', method: 'devices',   expect: { devices: [] } });
-/* QWRT 定制接口：conntrack 字节级记账（含硬件卸载流量），精确口径。
-   rates 字段只对传入的 addresses 返回，故需先取租约里的客户端 IP。 */
+/* QWRT 定制接口：返回已记录的客户端流量；PPE 分载是否被计入由后端能力决定。 */
 var callClientRates = rpc.declare({ object: 'luci.client-rates', method: 'get', params: [ 'addresses' ], expect: { '': {} } });
 var callLeases      = rpc.declare({ object: 'luci-rpc', method: 'getDHCPLeases', expect: { '': {} } });
 var callHostHints   = rpc.declare({ object: 'luci-rpc', method: 'getHostHints', expect: { '': {} } });
@@ -74,6 +73,19 @@ function rate(n) {
 	if (m >= 100) return m.toFixed(0) + ' Mbps';
 	if (m >= 10) return m.toFixed(1) + ' Mbps';
 	return m.toFixed(2) + ' Mbps';
+}
+
+function readFlowConfig() {
+	return L.require('uci').then(function(uci) {
+		return uci.load('firewall').then(function() {
+			return {
+				known: true,
+				sw: uci.get('firewall', '@defaults[0]', 'flow_offloading') === '1',
+				hw: uci.get('firewall', '@defaults[0]', 'flow_offloading_hw') === '1',
+				hw6: uci.get('firewall', '@defaults[0]', 'flow_offloading_hw_ipv6') === '1'
+			};
+		});
+	}).catch(function() { return null; });
 }
 
 function duration(sec) {
@@ -252,32 +264,69 @@ return view.extend({
 			: { up: rx, down: tx, cumUp: crx, cumDown: ctx, upLabel: '↑', downLabel: '↓' };
 	},
 
-	/* 汇总 conntrack 累计字节（用于累计量显示）；
-	   速率则取厂商接口的 rates 字段——它已按 interval/window 平滑，
-	   比在浏览器侧对累计值做差分稳定得多。 */
-	sumConntrack: function(data, t) {
-		var traffic = (data && data.traffic) || {};
-		var up = 0, down = 0;
-		Object.keys(traffic).forEach(function(mac) {
-			var v = traffic[mac] || {};
-			up += parseInt(v.upload, 10) || 0;
-			down += parseInt(v.download, 10) || 0;
-		});
-		return { up: up, down: down, t: t };
-	},
+		/* 汇总 conntrack 累计字节；后端 rates 默认按 B/s 返回，统一在此转换为 bit/s。 */
+		sumConntrack: function(data, t) {
+			var traffic = (data && data.traffic) || {};
+			var up = 0, down = 0;
+			Object.keys(traffic).forEach(function(mac) {
+				var v = traffic[mac] || {};
+				up += parseInt(v.upload, 10) || 0;
+				down += parseInt(v.download, 10) || 0;
+			});
+			return { up: up, down: down, t: t };
+		},
 
-	/* 从租约里收集客户端 IPv4 地址（去重，限 1024 与厂商视图同口径） */
-	leaseAddresses: function(leases) {
-		var list = (leases && leases.dhcp_leases) || [];
-		var out = [], seen = {};
-		list.forEach(function(l) {
-			var ip = l && l.ipaddr;
-			if (!ip || seen[ip]) return;
-			seen[ip] = 1;
-			out.push(ip);
-		});
-		return out.slice(0, 1024);
-	},
+		rateBits: function(value, data) {
+			var n = Number(value);
+			if (!isFinite(n) || n < 0) return 0;
+			return data && data.unit === 'bits_per_second' ? n : n * 8;
+		},
+
+		validClientSample: function(data) {
+			return !!(data && data.source === 'conntrack' && data.incomplete !== true);
+		},
+
+		deviceRate: function(name) {
+			var r = this.rates[name];
+			return r && r.valid ? r : null;
+		},
+
+		wanRate: function() {
+			var names = [ this.wanDev, this.wanPortDev ];
+			for (var i = 0; i < names.length; i++) {
+				var name = names[i];
+				var r = name ? this.deviceRate(name) : null;
+				if (r) return { name: name, rx: r.rx, tx: r.tx };
+			}
+			return null;
+		},
+
+		/* 从租约收集客户端 IPv4/IPv6 地址（去重，限 1024）。 */
+		leaseAddresses: function(leases) {
+			var list = (leases && leases.dhcp_leases) || [];
+			var out = [], seen = {};
+			list.forEach(function(l) {
+				[].concat(l && l.ipaddr || [], l && l.ipaddrs || [], l && l.ip6addr || [], l && l.ip6addrs || []).forEach(function(ip) {
+					var n = normAddr(ip);
+					if (n && !seen[n]) { seen[n] = 1; out.push(n); }
+				});
+			});
+			return out.slice(0, 1024);
+		},
+
+		leaseIpMap: function(leases) {
+			var map = {};
+			((leases && leases.dhcp_leases) || []).forEach(function(l) {
+				var mac = String((l && l.macaddr) || '').toUpperCase();
+				if (!mac) return;
+				map[mac] = map[mac] || [];
+				[].concat(l.ipaddr || [], l.ipaddrs || [], l.ip6addr || [], l.ip6addrs || []).forEach(function(ip) {
+					var n = normAddr(ip);
+					if (n && map[mac].indexOf(n) < 0) map[mac].push(n);
+				});
+			});
+			return map;
+		},
 
 	/* 请求 rates 用的全量地址：租约 ∪ HostHints ∪ conntrack 已见 MAC。
 	   只传租约会漏掉静态 IP 设备（如 NAS），其流量仍计入 conntrack。 */
@@ -311,19 +360,20 @@ return view.extend({
 		return out;
 	},
 
-	/* 流量分载对统计的影响，如实呈现：
-	   分载开启时 Airoha PPE 把转发旁路内核，netdev 与 conntrack 都不再计数，
-	   界面上的速率会远低于真实值——这一点必须写在明面上。 */
-	flowSummary: function() {
-		if (!this.offload) return '—';
-		if (this.flowAccurate)
-			return E('span', { 'class': 'badge badge-success' }, '精确');
-		return E('span', {}, [
-			E('span', { 'class': 'badge badge-orange' }, '受限'),
-			E('span', { 'style': 'font-size:11px;color:#b45309;margin-left:6px' },
-				'流量分载已开启，速率会明显偏低')
-		]);
-	},
+		/* 流量统计只描述配置状态，不把 UCI 开关当成硬件计数准确性的证明。 */
+		flowSummary: function() {
+			if (!this.offload || !this.offload.known)
+				return E('span', {}, [
+					E('span', { 'class': 'badge badge-orange' }, '未知'),
+					E('span', { 'style': 'font-size:11px;color:#6b7280;margin-left:6px' }, '无法读取流量分载配置')
+				]);
+			if (this.offload.sw || this.offload.hw || this.offload.hw6)
+				return E('span', {}, [
+					E('span', { 'class': 'badge badge-orange' }, '已配置分载'),
+					E('span', { 'style': 'font-size:11px;color:#b45309;margin-left:6px' }, '内核/客户端计数可能漏计硬件转发流量')
+				]);
+			return E('span', {}, '配置未启用分载；计数覆盖未作硬件核验');
+		},
 
 	/* 第二低比特为 1 表示本地管理地址——手机/平板的 MAC 随机化就是这个特征，
 	   这类设备不会有稳定主机名，强行显示「未命名」只会制造噪音。 */
@@ -453,59 +503,56 @@ return view.extend({
 		return list;
 	},
 
-	/* 把 conntrack 结果落到 this.live */
-	ingestClients: function(rates) {
-		var self = this;
-		var traffic = (rates && rates.traffic) || {};
-		var totals  = (rates && rates.totals) || {};
-		var conns   = (rates && rates.connections) || {};
-		var rr      = (rates && rates.rates) || {};
+		/* 把已记录的客户端结果落到 this.live；不完整样本不冒充实时数据。 */
+		ingestClients: function(rates) {
+			var self = this;
+			if (!self.validClientSample(rates)) rates = {};
+			var traffic = rates.traffic || {};
+			var totals = rates.totals || {};
+			var conns = rates.connections || {};
+			var rr = rates.rates || {};
+			self.live = {};
+			Object.keys(traffic).forEach(function(mac) {
+				var t = traffic[mac] || {};
+				self.live[(mac || '').toUpperCase()] = {
+					up: 0, down: 0,
+					cumUp: parseInt(t.upload, 10) || 0,
+					cumDown: parseInt(t.download, 10) || 0,
+					total: parseInt(totals[mac], 10) || 0,
+					conns: parseInt(conns[mac], 10) || 0
+				};
+			});
+			Object.keys(rr).forEach(function(ip) {
+				var v = rr[ip] || {};
+				if (!v.ready || !v.mac) return;
+				var m = String(v.mac).toUpperCase();
+				if (!self.live[m]) self.live[m] = { up: 0, down: 0, cumUp: 0, cumDown: 0, total: 0, conns: 0 };
+				self.live[m].up += self.rateBits(v.upload, rates);
+				self.live[m].down += self.rateBits(v.download, rates);
+			});
+			var routed = rates.routed_connections || {};
+			var connSum = 0, routedSum = 0;
+			Object.keys(conns).forEach(function(m) { connSum += parseInt(conns[m], 10) || 0; });
+			Object.keys(routed).forEach(function(m) { routedSum += parseInt(routed[m], 10) || 0; });
+			self.connTotal = connSum;
+			self.connRouted = routedSum;
+		},
 
-		self.live = {};
-		Object.keys(traffic).forEach(function(mac) {
-			var t = traffic[mac] || {};
-			self.live[(mac || '').toUpperCase()] = {
-				up: 0, down: 0,
-				cumUp: parseInt(t.upload, 10) || 0,
-				cumDown: parseInt(t.download, 10) || 0,
-				total: parseInt(totals[mac], 10) || 0,
-				conns: parseInt(conns[mac], 10) || 0
-			};
-		});
-
-		Object.keys(rr).forEach(function(ip) {
-			var v = rr[ip] || {};
-			if (!v.ready || !v.mac) return;
-			var m = (v.mac || '').toUpperCase();
-			if (!self.live[m]) self.live[m] = { up: 0, down: 0, cumUp: 0, cumDown: 0, total: 0, conns: 0 };
-			self.live[m].up += Number(v.upload || 0) * 8;
-			self.live[m].down += Number(v.download || 0) * 8;
-		});
-
-		/* 整机活动连接数：conntrack 按 MAC 汇总，相加即全部活动连接。
-		   routed_connections 只计经三层路由的条目（纯二层交换不计入）。 */
-		var routed = (rates && rates.routed_connections) || {};
-		var connSum = 0, routedSum = 0;
-		Object.keys(conns).forEach(function(m) { connSum += parseInt(conns[m], 10) || 0; });
-		Object.keys(routed).forEach(function(m) { routedSum += parseInt(routed[m], 10) || 0; });
-		self.connTotal = connSum;
-		self.connRouted = routedSum;
-	},
-
-	/* 从 rates[ip] 汇总当前速率（厂商已平滑）。
-	   注意：rates 只对请求时传入的 addresses 返回，未传 IP 时为空对象。 */
-	ratesTotal: function(data) {
-		var rates = (data && data.rates) || {};
-		var up = 0, down = 0, any = false;
-		Object.keys(rates).forEach(function(ip) {
-			var r = rates[ip] || {};
-			if (!r.ready) return;
-			any = true;
-			up += Number(r.upload || 0);
-			down += Number(r.download || 0);
-		});
-		return any ? { up: up, down: down } : null;
-	},
+		/* 从 rates[ip] 汇总当前速率，统一输出 bit/s；不完整样本不参与汇总。 */
+		ratesTotal: function(data) {
+			if (!this.validClientSample(data)) return null;
+			var rates = data.rates || {};
+			var up = 0, down = 0, any = false;
+			var self = this;
+			Object.keys(rates).forEach(function(ip) {
+				var r = rates[ip] || {};
+				if (!r.ready) return;
+				any = true;
+				up += self.rateBits(r.upload, data);
+				down += self.rateBits(r.download, data);
+			});
+			return any ? { up: up, down: down } : null;
+		},
 
 	load: function() {
 		var self = this;
@@ -563,26 +610,23 @@ return view.extend({
 			tempsPromise,
 			L.resolveDefault(callDevStatusAll(), {}),
 			L.resolveDefault(callIfaceDump(), { interface: [] }),
-			L.resolveDefault(callLeases(), {}).then(function(leases) {
-				self.leases = leases || {};
-				self.leaseAddrs = self.leaseAddresses(leases);
-				return Promise.all([
-					L.resolveDefault(callClientRates(self.leaseAddrs), {}),
-					L.resolveDefault(callHostHints(), {}),
-					L.resolveDefault(callQosState(), {})
-				]);
-			}),
-			/* [13] 流量分载开关：决定流量计数是否可信。
-			   Airoha PPE 会把分载的流转发旁路内核，netdev 与 conntrack 同时停止
-			   计数——实测偏差可达 1000 倍，因此必须在界面上说清楚。 */
-			L.require('uci').then(function(uci) {
-				return L.resolveDefault(uci.load('firewall'), null).then(function() {
-					return {
-						sw: uci.get('firewall', '@defaults[0]', 'flow_offloading') === '1',
-						hw: uci.get('firewall', '@defaults[0]', 'flow_offloading_hw') === '1'
-					};
-				});
-			}).catch(function() { return null; })
+				L.resolveDefault(callLeases(), {}).then(function(leases) {
+					self.leases = leases || {};
+					self.leaseIps = self.leaseIpMap(leases);
+					self.leaseAddrs = self.leaseAddresses(leases);
+					return Promise.all([
+						L.resolveDefault(callHostHints(), {}),
+						L.resolveDefault(callQosState(), {})
+					]).then(function(meta) {
+						self.hints = meta[0] || {};
+						return Promise.all([
+							L.resolveDefault(callClientRates(self.clientAddresses()), {}),
+						Promise.resolve(self.hints),
+						Promise.resolve(meta[1] || {})
+						]);
+					});
+				}),
+				readFlowConfig()
 		]).then(function(r) {
 			/* 把租约批次里的三个结果摊平进同一个数组，保持既有索引不变 */
 			var tail = r[12] || [];
@@ -749,16 +793,11 @@ return view.extend({
 			else if (rx < -24) quality = '良好';
 		}
 
-		/* 吞吐口径优先级（精度递减）：
-		   ① conntrack 记账（精确，含硬件卸载与 Wi-Fi 流量）——首选；
-		   ② WAN 物理端口 / 三层设备的内核计数器（未启用硬件卸载时准确）。
-		   取两者最大值：任一口径看到流量都不会误显示为 0。
-		   注意：不使用 XGEM 帧计数推算——PON 空闲帧与 PLOAM 会让它严重虚高。 */
-		var r1 = (this.wanDev && rates && rates[this.wanDev]) || {};
-		var r2 = (this.wanPortDev && rates && rates[this.wanPortDev]) || {};
-		var ct = this.ctRate || {};
-		var rxRate = Math.max(ct.rx || 0, r1.rx || 0, r2.rx || 0);
-		var txRate = Math.max(ct.tx || 0, r1.tx || 0, r2.tx || 0);
+			/* WAN 设备计数仅代表该设备可见的流量，PPE 分载可能不在其中。 */
+			var wan = this.wanRate();
+			var rxRate = wan ? wan.rx : null;
+			var txRate = wan ? wan.tx : null;
+			var wanLabel = wan ? '设备计数：' + wan.name + '（不含 Wi-Fi；分载可能漏计）' : 'WAN 设备计数暂无有效样本';
 
 		/* left: panel drawing (innerHTML keeps the SVG namespace intact) */
 		var diagram = E('div', { 'class': 'router-panel-diagram' });
@@ -800,11 +839,9 @@ return view.extend({
 				(line.xgtc_sync === 'in-sync' ? 'XGTC 同步成功' : (line.xgtc_sync || '未同步')) +
 				(isFinite(bias) ? ' · 偏置 ' + bias.toFixed(2) + ' mA' : '')),
 
-			metric('实时光链路吞吐',
-				'↓ ' + rate(rxRate || null) + '  ↑ ' + rate(txRate || null),
-				this.ctRate
-					? '全房合计（conntrack 记账）· 含 Wi-Fi 与硬件卸载'
-					: 'WAN 内核计数器 · 硬件卸载流量不可见')
+				metric('实时 WAN 吞吐',
+					'↓ ' + rate(rxRate) + '  ↑ ' + rate(txRate),
+					wanLabel)
 		]);
 
 		var portsBlock = this.portsSection(ports);
@@ -1154,9 +1191,9 @@ return view.extend({
 		/* buildClientList 读取 self.clientRates；必须与 state 同步，
 		   否则 conntrack 里那些没有租约/主机提示的设备不会进列表 */
 		self.clientRates = state.clientRates || {};
-		self.offload = state.offload;
-		self.flowAccurate = !(state.offload && (state.offload.sw || state.offload.hw));
-		self.ingestClients(state.clientRates);
+			self.offload = state.offload;
+			self.ingestClients(state.clientRates);
+
 
 		/* ── 动态接口发现（零硬编码）──────────────────────────────
 		   WAN 三层设备：network.interface dump 中 'wan' 逻辑接口绑定的设备
@@ -1169,22 +1206,18 @@ return view.extend({
 		});
 		self.wanDev = (wanIf && wanIf.device) || null;
 
-		self.wanPortDev = null;
-		state.ports.forEach(function(p) {
-			if (p.role === 'wan' && (!self.wanPortDev || p.device < self.wanPortDev))
-				self.wanPortDev = p.device;
-		});
-
-		var brStatus = state.allDev['br-lan'] || {};
-		self.brMembers = brStatus['bridge-members'] || [];
-
-		state.ports.forEach(function(p) {
-			/* 角色校准：桥接成员一律是 LAN（板级配置残留 wan 指向网口时纠偏） */
-			if (self.brMembers.indexOf(p.device) >= 0)
-				p.role = 'lan';
-			if (state.allDev[p.device])
-				self.devStatus[p.device] = state.allDev[p.device];
-		});
+			/* 端口角色先排除桥成员，再选择物理 WAN，避免板级残留角色误判。 */
+			var brStatus = state.allDev['br-lan'] || {};
+			self.brMembers = brStatus['bridge-members'] || [];
+			var wanPort = null;
+			state.ports.forEach(function(p) {
+				if (p.role === 'wan' && (!wanPort || p.device < wanPort)) wanPort = p.device;
+			});
+			self.wanPortDev = (wanPort && self.brMembers.indexOf(wanPort) < 0) ? wanPort : null;
+			state.ports.forEach(function(p) {
+				if (self.brMembers.indexOf(p.device) >= 0) p.role = 'lan';
+				if (state.allDev[p.device]) self.devStatus[p.device] = state.allDev[p.device];
+			});
 
 		/* 用全量设备快照播种采样基线（第二个采样周期即可给出真实速率） */
 		Object.keys(state.allDev).forEach(function(name) {
@@ -1249,9 +1282,10 @@ return view.extend({
 					}
 					return { pon: parse(rr[0]), temps: parse(rr[1]) };
 				}).catch(function() { return null; }), null),
-				L.resolveDefault(callDevStatusAll(), {}),
-				L.resolveDefault(callClientRates(self.clientAddresses()), {}),
-				Promise.all(self.wifiInfos.map(function(w) {
+					L.resolveDefault(callDevStatusAll(), {}),
+					L.resolveDefault(callClientRates(self.clientAddresses()), {}),
+					readFlowConfig(),
+					Promise.all(self.wifiInfos.map(function(w) {
 					return L.resolveDefault(callWifiAssoc(w.device), []).then(function(assoc) {
 						w.clients = Array.isArray(assoc) ? assoc : ((assoc && Array.isArray(assoc.results)) ? assoc.results : []);
 					});
@@ -1263,64 +1297,72 @@ return view.extend({
 				if (r[2] && r[2].temps) state.wifiTemps = r[2].temps;
 
 
-				/* 精确口径：优先用厂商已平滑的 rates（按客户端 IP 求和）；
-				   rates 不可用时回退到累计值差分。均含硬件卸载流量。 */
-				var ct = r[4] || {};
-				if (ct && ct.source === 'conntrack') {
-					state.clientRates = ct;
-					self.clientRates = ct;
-
-					var rt = self.ratesTotal(ct);
-					if (rt) {
-						self.ctRate = { rx: rt.down, tx: rt.up };
-					} else {
-						var curCt = self.sumConntrack(ct, Date.now());
-						var prevCt = self.ctSamples;
-						if (prevCt && curCt.t > prevCt.t && curCt.down >= prevCt.down && curCt.up >= prevCt.up) {
-							var cdt = (curCt.t - prevCt.t) / 1000;
-							self.ctRate = {
-								rx: (curCt.down - prevCt.down) * 8 / cdt,
-								tx: (curCt.up - prevCt.up) * 8 / cdt
-							};
+					/* 已记录客户端样本不代表 PPE 硬件流量完整。 */
+					var ct = r[4] || {};
+					if (self.validClientSample(ct)) {
+						state.clientRates = ct;
+						self.clientRates = ct;
+						var rt = self.ratesTotal(ct);
+						if (rt) {
+							self.ctRate = { rx: rt.down, tx: rt.up };
+						} else {
+							var curCt = self.sumConntrack(ct, Date.now());
+							var prevCt = self.ctSamples;
+							if (prevCt && curCt.t > prevCt.t && curCt.down >= prevCt.down && curCt.up >= prevCt.up) {
+								var cdt = (curCt.t - prevCt.t) / 1000;
+								self.ctRate = {
+									rx: (curCt.down - prevCt.down) * 8 / cdt,
+									tx: (curCt.up - prevCt.up) * 8 / cdt
+								};
+							} else {
+								self.ctRate = null;
+							}
+							self.ctSamples = curCt;
 						}
-						self.ctSamples = curCt;
+						self.ctTotals = self.sumConntrack(ct, Date.now());
+					} else {
+						state.clientRates = {};
+						self.clientRates = {};
+						self.ctRate = null;
+						self.ctTotals = null;
 					}
-					self.ctTotals = self.sumConntrack(ct, Date.now());
-
-					/* 在线设备实时速率（同源 conntrack，含硬件卸载） */
-					self.ingestClients(ct);
+					self.offload = r[5];
+					self.ingestClients(state.clientRates);
 					if (self.paintClientList) {
-						var beforeMacs = Object.keys(self.clientNodes || {}).sort().join();
-						var nowMacs = Object.keys(self.live || {}).sort().join();
-						/* 出现新客户端才重建，否则只刷文本（保住用户正在输入的值） */
 						var nowList = self.buildClientList().map(function(c) { return c.mac; }).sort().join();
 						var haveList = Object.keys(self.clientNodes || {}).sort().join();
 						if (nowList !== haveList && self.rebuildClientList) self.rebuildClientList();
 						else self.paintClientList();
 					}
-				}
 
-				/* 单次全量差分：所有设备一次 RPC 全部算出速率，不存在重复采样互踩 */
-				var all = r[3] || {};
-				Object.keys(all).forEach(function(name) {
-					var st = all[name] || {};
-					var s = st.statistics || {};
-					var cur = {
-						rx: parseInt(s.rx_bytes, 10) || 0,
-						tx: parseInt(s.tx_bytes, 10) || 0,
-						t: Date.now()
-					};
-					var prev = self.samples[name];
-
-					if (prev && cur.t > prev.t) {
-						var dt = (cur.t - prev.t) / 1000;
-						self.rates[name] = {
-							rx: (cur.rx - prev.rx) * 8 / dt,
-							tx: (cur.tx - prev.tx) * 8 / dt
+					/* 单次全量差分：计数回退/接口重置后等待新的基线。 */
+					var all = r[3] || {};
+					Object.keys(all).forEach(function(name) {
+						var st = all[name] || {};
+						var s = st.statistics || {};
+						var cur = {
+							rx: parseInt(s.rx_bytes, 10) || 0,
+							tx: parseInt(s.tx_bytes, 10) || 0,
+							t: Date.now()
 						};
-					}
-					self.samples[name] = cur;
-				});
+						var prev = self.samples[name];
+						if (prev && cur.t > prev.t && cur.rx >= prev.rx && cur.tx >= prev.tx) {
+							var dt = (cur.t - prev.t) / 1000;
+							self.rates[name] = {
+								rx: (cur.rx - prev.rx) * 8 / dt,
+								tx: (cur.tx - prev.tx) * 8 / dt,
+								valid: true
+							};
+						} else {
+							delete self.rates[name];
+						}
+						self.samples[name] = cur;
+					});
+
+					var wifiAssoc = r[6] || [];
+					state.wifi.forEach(function(w, i) {
+						if (wifiAssoc[i]) w.clients = wifiAssoc[i];
+					});
 
 				state.ports.forEach(function(p) {
 					if (all[p.device]) self.devStatus[p.device] = all[p.device];

@@ -3,6 +3,7 @@
 'require poll';
 'require rpc';
 'require ui';
+'require uci';
 
 /*
  * Falcon topology page — "整机架构与内部详情".
@@ -29,9 +30,10 @@ var callIfaceDump = rpc.declare({ object: 'network.interface', method: 'dump', e
 var callPorts     = rpc.declare({ object: 'luci', method: 'getBuiltinEthernetPorts', expect: { result: [] } });
 /* 无参调用一次返回全部设备（含统计计数）：单次 RPC 覆盖所有接口，速率零遗漏 */
 var callDevStatusAll = rpc.declare({ object: 'network.device', method: 'status', expect: { '': {} } });
-/* QWRT 定制接口：conntrack 字节级记账（含硬件卸载流量），精确口径 */
+/* QWRT 定制接口：返回已记录的客户端流量；不保证覆盖 PPE 硬件卸载流量。 */
 var callClientRates = rpc.declare({ object: 'luci.client-rates', method: 'get', params: [ 'addresses' ], expect: { '': {} } });
 var callLeases      = rpc.declare({ object: 'luci-rpc', method: 'getDHCPLeases', expect: { '': {} } });
+var callHostHints   = rpc.declare({ object: 'luci-rpc', method: 'getHostHints', expect: { '': {} } });
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -61,6 +63,34 @@ function parseCpu(s) {
 	if ((m = /PPE0:\s*(\d+)/.exec(s)))      o.ppe0 = parseInt(m[1], 10);
 	if ((m = /PPE1:\s*(\d+)/.exec(s)))      o.ppe1 = parseInt(m[1], 10);
 	return o;
+}
+
+function rateBits(value, data) {
+	var n = Number(value);
+	if (!isFinite(n) || n < 0) return 0;
+	return data && data.unit === 'bits_per_second' ? n : n * 8;
+}
+
+function validClientSample(data) {
+	return !!(data && data.source === 'conntrack' && data.incomplete !== true);
+}
+
+function readFlowConfig() {
+	return L.require('uci').then(function(uci) {
+		return uci.load('firewall').then(function() {
+			return {
+				known: true,
+				sw: uci.get('firewall', '@defaults[0]', 'flow_offloading') === '1',
+				hw: uci.get('firewall', '@defaults[0]', 'flow_offloading_hw') === '1',
+				hw6: uci.get('firewall', '@defaults[0]', 'flow_offloading_hw_ipv6') === '1'
+			};
+		});
+	}).catch(function() { return null; });
+}
+
+function normAddr(ip) {
+	ip = (ip || '').replace(/\/\d+$/, '');
+	return ip ? ip.toLowerCase() : null;
 }
 
 function chipTemp(cpuinfo) {
@@ -166,11 +196,12 @@ function topologyMarkup(bind) {
 		+ '<rect width="118" height="88" rx="5" fill="#ffffff" stroke="#cbd5e1"/>'
 		+ '<circle cx="106" cy="14" r="3.5" fill="#10b981"/>'
 		+ '<text x="10" y="23" font-size="11.5" font-weight="700" fill="#334155">PPE / HWNAT</text>'
-		+ '<text x="10" y="39" font-size="9.5" fill="#64748b">硬件包转发引擎</text>'
-		+ '<text x="10" y="60" font-size="9.5" fill="#2563eb"'
-		+ b('down') + '>↓ —</text>'
-		+ '<text x="10" y="76" font-size="9.5" fill="#ea580c"'
-		+ b('up') + '>↑ —</text>'
+			+ '<text x="10" y="39" font-size="9" fill="#64748b" title="分载开启时，内核网卡计数可能漏计 PPE 硬件转发流量"'
+			+ b('offload') + '>分载：未知</text>'
+			+ '<text x="10" y="60" font-size="8.5" fill="#64748b"'
+			+ b('wanname') + '>WAN —</text>'
+			+ '<text x="10" y="76" font-size="9.5" fill="#ea580c"'
+			+ b('up') + '>↑ —</text>'
 		+ '</g>'
 
 		+ '<g transform="translate(380,132)">'
@@ -232,34 +263,36 @@ return view.extend({
 	board: {},
 	ifaces: [],
 
-	/* 从租约收集客户端 IPv4 地址 */
-	leaseAddresses: function(leases) {
-		var list = (leases && leases.dhcp_leases) || [];
-		var out = [], seen = {};
-		list.forEach(function(l) {
-			var ip = l && l.ipaddr;
-			if (!ip || seen[ip]) return;
-			seen[ip] = 1;
-			out.push(ip);
-		});
-		return out.slice(0, 1024);
-	},
+		leaseAddresses: function(leases, hints) {
+			var out = [], seen = {};
+			function add(ip) {
+				var n = normAddr(ip);
+				if (n && !seen[n]) { seen[n] = 1; out.push(n); }
+			}
+			((leases && leases.dhcp_leases) || []).forEach(function(l) {
+				[].concat(l && l.ipaddr || [], l && l.ipaddrs || [], l && l.ip6addr || [], l && l.ip6addrs || []).forEach(add);
+			});
+			Object.keys(hints || {}).forEach(function(mac) {
+				var h = hints[mac] || {};
+				[].concat(h.ipaddrs || [], h.ip6addrs || []).forEach(add);
+			});
+			return out.slice(0, 1024);
+		},
 
-	/* 从 rates[ip] 汇总当前速率（厂商已平滑，含硬件卸载） */
-	ratesTotal: function(data) {
-		var rates = (data && data.rates) || {};
-		var up = 0, down = 0, any = false;
-		Object.keys(rates).forEach(function(ip) {
-			var r = rates[ip] || {};
-			if (!r.ready) return;
-			any = true;
-			up += Number(r.upload || 0);
-			down += Number(r.download || 0);
-		});
-		return any ? { up: up, down: down } : null;
-	},
+		rateTotal: function(data) {
+			if (!validClientSample(data)) return null;
+			var rates = data.rates || {}, up = 0, down = 0, any = false;
+			Object.keys(rates).forEach(function(ip) {
+				var r = rates[ip] || {};
+				if (!r.ready) return;
+				any = true;
+				up += rateBits(r.upload, data);
+				down += rateBits(r.download, data);
+			});
+			return any ? { up: up, down: down } : null;
+		},
 
-	/* 汇总 conntrack 累计字节（精确，含硬件卸载） */
+			/* conntrack 累计字节是已记录客户端流量，不声称覆盖 PPE 硬件流量。 */
 	sumConntrack: function(data, t) {
 		var traffic = (data && data.traffic) || {};
 		var up = 0, down = 0;
@@ -304,11 +337,16 @@ return view.extend({
 			L.resolveDefault(callIfaceDump(), { interface: [] }),
 			ponPromise,
 			L.resolveDefault(callDevStatusAll(), {}),
-			L.resolveDefault(callPorts(), []),
-			L.resolveDefault(callLeases(), {}).then(function(leases) {
-				self.leaseAddrs = self.leaseAddresses(leases);
-				return L.resolveDefault(callClientRates(self.leaseAddrs), {});
-			})
+				L.resolveDefault(callPorts(), []),
+				Promise.all([
+					L.resolveDefault(callLeases(), {}),
+					L.resolveDefault(callHostHints(), {})
+				]).then(function(meta) {
+					var leases = meta[0] || {};
+					self.leaseAddrs = self.leaseAddresses(leases, meta[1] || {});
+					return L.resolveDefault(callClientRates(self.leaseAddrs), {});
+				}),
+				readFlowConfig()
 		]);
 	},
 
@@ -378,6 +416,7 @@ return view.extend({
 		self.allDev   = data[7] || {};
 		self.ports    = Array.isArray(data[8]) ? data[8] : [];
 		self.clientRates = data[9] || {};
+		self.offload = data[10] || null;
 
 		/* ── 动态接口发现（零硬编码）────────────────────────────── */
 		var wanIf = null;
@@ -426,27 +465,51 @@ return view.extend({
 			])
 		]));
 
-		/* --- topology --- */
-		var topoHost = E('div', { id: 'falcon-topo' });
-		topoHost.innerHTML = topologyMarkup(true);
-
-		var topoWrap = E('div', { 'class': 'topology-container' }, [
-			E('div', { style: 'width:100%;overflow-x:auto' }, topoHost),
-			E('div', { 'class': 'topology-legend' }, [
-				E('div', { 'class': 'legend-items' }, [
-					E('div', { 'class': 'legend-item' }, [
-						E('span', { 'class': 'legend-line line-blue' }),
-						E('span', {}, '1577 nm · 下行光载波')
-					]),
-					E('div', { 'class': 'legend-item' }, [
-						E('span', { 'class': 'legend-line line-orange' }),
-						E('span', {}, '1270 nm · 上行突发激光')
-					])
-				]),
-				E('div', {}, '数值实时刷新 · 每 5 秒采样')
-			])
-		]);
-		host.appendChild(topoWrap);
+			/* --- topology --- */
+			var topoHost = E('div', { id: 'falcon-topo' });
+			topoHost.innerHTML = topologyMarkup(true);
+			var topoViewport = E('div', { 'class': 'topology-viewport' }, topoHost);
+			var zoomValue = E('output', { 'class': 'topology-zoom-value', 'for': 'falcon-topology-zoom' }, '100%');
+			var zoomInput = E('input', {
+				'id': 'falcon-topology-zoom',
+				'class': 'topology-zoom-input',
+				'type': 'range',
+				'min': '50',
+				'max': '300',
+				'step': '10',
+				'value': '100',
+				'aria-label': '拓扑图缩放'
+			});
+			var zoomReset = E('button', {
+				'class': 'topology-zoom-reset',
+				'type': 'button',
+				'click': function() { setZoom(100); }
+			}, '适应宽度');
+			var zoomScale = 100;
+			function setZoom(value) {
+				zoomScale = Math.max(50, Math.min(300, parseInt(value, 10) || 100));
+				zoomInput.value = String(zoomScale);
+				zoomValue.textContent = zoomScale + '%';
+				var svg = topoHost.querySelector('svg');
+				if (svg) {
+					svg.style.width = zoomScale + '%';
+					svg.style.height = 'auto';
+					svg.style.maxWidth = 'none';
+				}
+			}
+			if (zoomInput.addEventListener) {
+				zoomInput.addEventListener('input', function() { setZoom(zoomInput.value); });
+				zoomInput.addEventListener('change', function() { setZoom(zoomInput.value); });
+			}
+			setZoom(100);
+			var zoomTools = E('div', { 'class': 'topology-zoom-tools' }, [
+				E('span', { 'class': 'topology-zoom-label' }, '缩放'),
+				zoomInput,
+				zoomValue,
+				zoomReset
+			]);
+			var topoWrap = E('div', { 'class': 'topology-container' }, [ zoomTools, topoViewport ]);
+			host.appendChild(topoWrap);
 
 		/* --- 9 sparkline tiles --- */
 		var tiles = E('div', { 'class': 'sparkline-cards-grid' });
@@ -519,32 +582,22 @@ return view.extend({
 			}).then(function(r) {
 				return r && r.code === 0 && r.stdout ? JSON.parse(r.stdout) : null;
 			}).catch(function() { return null; }), null),
-			L.resolveDefault(callDevStatusAll(), {}),
-			L.resolveDefault(callClientRates(self.leaseAddrs || []), {})
+				L.resolveDefault(callDevStatusAll(), {}),
+				L.resolveDefault(callClientRates(self.leaseAddrs || []), {}),
+				readFlowConfig()
 		]).then(function(r) {
 			if (r[0]) self.info = r[0];
 			if (r[1]) self.cpuusage = r[1];
-			if (r[2]) self.pon = r[2];  /* 含 counters，供帧率估算 */
+				if (r[2]) self.pon = r[2];
+				else self.pon = null;
 
-			/* 精确口径：conntrack 累计差分 */
+			/* 客户端 RPC 只用于已记录样本；PPE 硬件流量是否计入由后端决定。 */
 			var ct = r[4] || {};
-			if (ct && ct.source === 'conntrack') {
-				var rt = self.ratesTotal(ct);
-				if (rt) {
-					self.ctRate = { rx: rt.down, tx: rt.up };
-				} else {
-					var curCt = self.sumConntrack(ct, Date.now());
-					var prevCt = self.ctSamples;
-					if (prevCt && curCt.t > prevCt.t && curCt.down >= prevCt.down && curCt.up >= prevCt.up) {
-						var cdt = (curCt.t - prevCt.t) / 1000;
-						self.ctRate = {
-							rx: (curCt.down - prevCt.down) * 8 / cdt,
-							tx: (curCt.up - prevCt.up) * 8 / cdt
-						};
-					}
-					self.ctSamples = curCt;
-				}
-			}
+			var rt = self.rateTotal(ct);
+			if (rt) self.ctRate = { rx: rt.down, tx: rt.up };
+			else self.ctRate = null;
+			self.offload = r[5];
+
 
 			/* 单次全量差分：所有设备一次 RPC 全部算出速率 */
 			var all = r[3] || {};
@@ -557,14 +610,17 @@ return view.extend({
 					t: Date.now()
 				};
 				var prev = self.samples[name];
-				if (prev && cur.t > prev.t) {
-					var dt = (cur.t - prev.t) / 1000;
-					self.rates[name] = {
-						rx: (cur.rx - prev.rx) * 8 / dt,
-						tx: (cur.tx - prev.tx) * 8 / dt
-					};
-				}
-				self.samples[name] = cur;
+					if (prev && cur.t > prev.t && cur.rx >= prev.rx && cur.tx >= prev.tx) {
+						var dt = (cur.t - prev.t) / 1000;
+						self.rates[name] = {
+							rx: (cur.rx - prev.rx) * 8 / dt,
+							tx: (cur.tx - prev.tx) * 8 / dt,
+							valid: true
+						};
+					} else {
+						delete self.rates[name];
+					}
+					self.samples[name] = cur;
 			});
 
 			self.updateTopology();
@@ -607,16 +663,29 @@ return view.extend({
 		put('pped', 'PPE0: ' + (cpu.ppe0 != null ? cpu.ppe0 : '—') + ' · PPE1: ' + (cpu.ppe1 != null ? cpu.ppe1 : '—'));
 		put('onu',  (reg.onu_state || '—') + (reg.onu_state === 'O5' ? ' · 正常运行' : ''));
 
-		/* 口径：conntrack 记账优先（精确，含硬件卸载），回退 WAN 内核计数器。
-		   不再使用 XGEM 帧率估算——空闲帧/PLOAM 会让它严重虚高（实测虚高 300 倍）。 */
-		var r1 = (this.wanPortDev && this.rates[this.wanPortDev]) || {};
-		var r2 = (this.wanDev && this.rates[this.wanDev]) || {};
-		var ct = this.ctRate || {};
-		var wanRx = Math.max(ct.rx || 0, r1.rx || 0, r2.rx || 0);
-		var wanTx = Math.max(ct.tx || 0, r1.tx || 0, r2.tx || 0);
-		put('down', '↓ ' + (wanRx > 0 ? rate(wanRx) : '—'));
-		put('up',   '↑ ' + (wanTx > 0 ? rate(wanTx) : '—'));
-		put('wan',  'WAN ' + (wanRx > 0 ? rate(wanRx) : '—'));
+			var offload = this.offload;
+			var offloadActive = !!(offload && (offload.sw || offload.hw || offload.hw6));
+			var offloadText = !offload || !offload.known ? '分载：未知'
+				: (offloadActive ? '分载：开启' : '分载：关闭');
+			put('offload', offloadText);
+			var offloadEl = topo.querySelector('[data-bind="offload"]');
+			if (offloadEl)
+				offloadEl.setAttribute('title', !offload || !offload.known
+					? '无法读取流量分载配置；统计覆盖未知'
+					: (offloadActive
+						? '分载已配置，内核/客户端计数可能漏计 PPE 硬件转发流量'
+						: '配置未启用分载；计数精度仍需硬件实测核验'));
+
+			/* WAN 指标固定使用一个设备来源；不得与客户端累计或其他接口拼接。 */
+			var wanName = this.wanDev || this.wanPortDev;
+			var wan = wanName && this.rates[wanName] && this.rates[wanName].valid ? this.rates[wanName] : null;
+			var wanRx = wan ? wan.rx : null;
+			var wanTx = wan ? wan.tx : null;
+			put('down', '↓ ' + rate(wanRx));
+			put('up', '↑ ' + rate(wanTx));
+			put('wan', 'WAN ' + rate(wanRx));
+			var wanNameEl = topo.querySelector('[data-bind="wanname"]');
+			if (wanNameEl) wanNameEl.textContent = wan ? wanName : '—';
 	},
 
 	updateTiles: function(first) {
@@ -737,30 +806,32 @@ return view.extend({
 			]));
 		});
 
-		var ponLine = (this.pon && this.pon.line) || {};
-		var ponFe = (this.pon && this.pon.frontend) || {};
-		var ponReg = (this.pon && this.pon.registration) || {};
-		var ponDesc = [];
+			var ponLine = (this.pon && this.pon.line) || {};
+			var ponFe = (this.pon && this.pon.frontend) || {};
+			var ponReg = (this.pon && this.pon.registration) || {};
+			var ponDesc = [];
+			var ponReady = !!(this.pon && ponReg.onu_state === 'O5');
 
-		if (ponReg.onu_state) {
-			ponDesc.push(ponReg.onu_state === 'O5' ? 'O5 · 正常运行' : ponReg.onu_state);
-		} else if (ponLine.lifecycle) {
-			ponDesc.push(ponLine.lifecycle);
-		}
+			if (ponReg.onu_state) {
+				ponDesc.push(ponReg.onu_state === 'O5' ? 'O5 · 正常运行' : ponReg.onu_state);
+			} else if (ponLine.lifecycle) {
+				ponDesc.push(ponLine.lifecycle);
+			} else if (!this.pon) {
+				ponDesc.push('读取失败');
+			}
 
-		if (isFinite(ponFe.rx_power_dbm)) {
-			ponDesc.push('收光 ' + ponFe.rx_power_dbm.toFixed(1) + ' dBm');
-		}
-		if (isFinite(ponFe.tx_power_dbm)) {
-			ponDesc.push('发光 ' + ponFe.tx_power_dbm.toFixed(1) + ' dBm');
-		}
+			if (ponFe.rx_power_dbm != null && isFinite(Number(ponFe.rx_power_dbm))) {
+				ponDesc.push('收光 ' + Number(ponFe.rx_power_dbm).toFixed(1) + ' dBm');
+			}
+			if (ponFe.tx_power_dbm != null && isFinite(Number(ponFe.tx_power_dbm))) {
+				ponDesc.push('发光 ' + Number(ponFe.tx_power_dbm).toFixed(1) + ' dBm');
+			}
 
-		var modeName = (ponLine.active_mode || 'XG-PON').toUpperCase();
-		out.push(E('div', { 'class': 'vpe-block', style: 'background:#f8fafc;border-color:#cbd5e1' }, [
-			E('div', { 'class': 'vpe-head', style: 'color:#334155' }, 'PON 光链路 · ' + modeName),
-			E('div', { 'class': 'vpe-desc', style: 'color:#64748b' },
-				ponDesc.length ? ponDesc.join(' · ') : '已连接')
-		]));
+			var modeName = (ponLine.active_mode || 'XG-PON').toUpperCase();
+			out.push(E('div', { 'class': 'vpe-block vpe-block-pon' + (ponReady ? ' is-connected' : '') }, [
+				E('div', { 'class': 'vpe-head' }, 'PON 光链路 · ' + modeName),
+				E('div', { 'class': 'vpe-desc' }, ponDesc.length ? ponDesc.join(' · ') : '未连接')
+			]));
 
 		host.innerHTML = '';
 		out.forEach(function(b) { host.appendChild(b); });
