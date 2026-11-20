@@ -89,9 +89,17 @@
 	--border-color-l: 11%;
 }
 
+/* 全局清除所有历史遗留的 text-shadow，彻底根除字体发虚、白边与重影 */
+*,
+*::before,
+*::after {
+	text-shadow: none !important;
+}
+
 html, body {
-	-webkit-font-smoothing: auto;
-	-moz-osx-font-smoothing: auto;
+	font-family: var(--font-sans);
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
 	text-rendering: optimizeLegibility;
 }
 
@@ -378,12 +386,14 @@ footer {
 	border-radius: 6px !important;
 	display: block !important;
 	text-decoration: none !important;
+	text-shadow: none !important;
 	transition: all 0.15s ease !important;
 }
 
 .falcon-sidebar .dropdown-menu > li > a:hover {
 	color: #1677ff !important;
 	background: #f0f7ff !important;
+	text-shadow: none !important;
 }
 
 .falcon-sidebar .dropdown-menu > li.active > a,
@@ -391,6 +401,7 @@ footer {
 	color: #1677ff !important;
 	font-weight: 600 !important;
 	background: #eff6ff !important;
+	text-shadow: none !important;
 }
 
 /* --- 右侧主内容区域 (Main Area) --- */
@@ -2512,8 +2523,8 @@ select:focus,
   font-family: var(--font-family);
   font-size: 13px;
   line-height: 1.5;
-  -webkit-font-smoothing: auto;
-  -moz-osx-font-smoothing: auto;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
