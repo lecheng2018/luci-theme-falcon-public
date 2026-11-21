@@ -283,7 +283,8 @@ return view.extend({
 		},
 
 		validClientSample: function(data) {
-			return !!(data && (data.source === 'conntrack' || data.traffic || data.rates) && data.incomplete !== true);
+			if (!data || typeof data !== 'object') return false;
+			return !!(data.source === 'conntrack' || data.traffic || data.rates || data.totals);
 		},
 
 		deviceRate: function(name) {
@@ -503,28 +504,33 @@ return view.extend({
 		return list;
 	},
 
-		/* 把已记录的客户端结果落到 this.live；不完整样本不冒充实时数据。 */
+		/* 把已记录的客户端结果落到 this.live；不完整样本保留已有累计，防抖防清零。 */
 		ingestClients: function(rates) {
 			var self = this;
-			if (!self.validClientSample(rates)) rates = {};
+			if (!self.validClientSample(rates)) return;
 			var traffic = rates.traffic || {};
 			var totals = rates.totals || {};
 			var conns = rates.connections || {};
 			var rr = rates.rates || {};
-			self.live = {};
+			self.live = self.live || {};
 			Object.keys(traffic).forEach(function(mac) {
+				var m = (mac || '').toUpperCase();
+				if (!m) return;
 				var t = traffic[mac] || {};
-				self.live[(mac || '').toUpperCase()] = {
+				var prev = self.live[m] || { up: 0, down: 0, cumUp: 0, cumDown: 0, total: 0, conns: 0 };
+				var newCumUp = parseInt(t.upload, 10) || 0;
+				var newCumDown = parseInt(t.download, 10) || 0;
+				self.live[m] = {
 					up: 0, down: 0,
-					cumUp: parseInt(t.upload, 10) || 0,
-					cumDown: parseInt(t.download, 10) || 0,
-					total: parseInt(totals[mac], 10) || 0,
-					conns: parseInt(conns[mac], 10) || 0
+					cumUp: Math.max(prev.cumUp || 0, newCumUp),
+					cumDown: Math.max(prev.cumDown || 0, newCumDown),
+					total: Math.max(prev.total || 0, parseInt(totals[mac], 10) || 0),
+					conns: conns[mac] != null ? parseInt(conns[mac], 10) : (prev.conns != null ? prev.conns : 0)
 				};
 			});
 			Object.keys(rr).forEach(function(ip) {
 				var v = rr[ip] || {};
-				if (!v.ready || !v.mac) return;
+				if (!v.mac) return;
 				var m = String(v.mac).toUpperCase();
 				if (!self.live[m]) self.live[m] = { up: 0, down: 0, cumUp: 0, cumDown: 0, total: 0, conns: 0 };
 				self.live[m].up += self.rateBits(v.upload, rates);
@@ -534,8 +540,10 @@ return view.extend({
 			var connSum = 0, routedSum = 0;
 			Object.keys(conns).forEach(function(m) { connSum += parseInt(conns[m], 10) || 0; });
 			Object.keys(routed).forEach(function(m) { routedSum += parseInt(routed[m], 10) || 0; });
-			self.connTotal = connSum;
-			self.connRouted = routedSum;
+			if (connSum > 0 || Object.keys(conns).length > 0) {
+				self.connTotal = connSum;
+				self.connRouted = routedSum;
+			}
 		},
 
 		/* 从 rates[ip] 汇总当前速率，统一输出 bit/s；不完整样本不参与汇总。 */
@@ -965,11 +973,18 @@ return view.extend({
 			clients.forEach(function(c) {
 				var n = nodes[c.mac];
 				if (!n) return;
-				var live = self.live[c.mac] || {};
-				n.up.textContent = '↑ ' + rate(live.up || 0);
-				n.down.textContent = '↓ ' + rate(live.down || 0);
-				n.cum.textContent = '累计 ↑ ' + bytes(live.cumUp || 0) + '  ↓ ' + bytes(live.cumDown || 0);
-				n.conn.textContent = '连接 ' + (live.conns != null ? live.conns : '—');
+				var live = self.live && self.live[c.mac];
+				if (live) {
+					n.up.textContent = '↑ ' + rate(live.up || 0);
+					n.down.textContent = '↓ ' + rate(live.down || 0);
+					n.cum.textContent = '累计 ↑ ' + bytes(live.cumUp || 0) + '  ↓ ' + bytes(live.cumDown || 0);
+					n.conn.textContent = '连接 ' + (live.conns != null ? live.conns : '—');
+				} else {
+					n.up.textContent = '↑ —';
+					n.down.textContent = '↓ —';
+					n.cum.textContent = '累计 —';
+					n.conn.textContent = '连接 —';
+				}
 				n.dot.className = 'status-dot' + (c.ips.length ? '' : ' status-dot-warn');
 			});
 		}
@@ -1320,14 +1335,9 @@ return view.extend({
 							self.ctSamples = curCt;
 						}
 						self.ctTotals = self.sumConntrack(ct, Date.now());
-					} else {
-						state.clientRates = {};
-						self.clientRates = {};
-						self.ctRate = null;
-						self.ctTotals = null;
+						self.ingestClients(state.clientRates);
 					}
 					self.offload = r[5];
-					self.ingestClients(state.clientRates);
 					if (self.paintClientList) {
 						var nowList = self.buildClientList().map(function(c) { return c.mac; }).sort().join();
 						var haveList = Object.keys(self.clientNodes || {}).sort().join();

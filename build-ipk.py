@@ -13,7 +13,7 @@ import tarfile
 BASE = os.path.abspath(os.path.dirname(__file__))
 PKG = "luci-theme-falcon"
 VERSION = "1.5.6"
-RELEASE = "2"
+RELEASE = "3"
 ARCH = "all"
 OUT_NAME = f"{PKG}_{VERSION}-{RELEASE}_{ARCH}.ipk"
 

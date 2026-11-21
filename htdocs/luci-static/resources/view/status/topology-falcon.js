@@ -72,7 +72,8 @@ function rateBits(value, data) {
 }
 
 function validClientSample(data) {
-	return !!(data && data.source === 'conntrack' && data.incomplete !== true);
+	if (!data || typeof data !== 'object') return false;
+	return !!(data.source === 'conntrack' || data.traffic || data.rates || data.totals);
 }
 
 function readFlowConfig() {
