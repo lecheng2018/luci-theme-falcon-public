@@ -283,7 +283,7 @@ return view.extend({
 		},
 
 		validClientSample: function(data) {
-			return !!(data && data.source === 'conntrack' && data.incomplete !== true);
+			return !!(data && (data.source === 'conntrack' || data.traffic || data.rates) && data.incomplete !== true);
 		},
 
 		deviceRate: function(name) {

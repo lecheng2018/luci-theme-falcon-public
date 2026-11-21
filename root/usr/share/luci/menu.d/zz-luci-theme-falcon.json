@@ -8,7 +8,8 @@
 		},
 		"depends": {
 			"acl": [
-				"luci-mod-status-index"
+				"luci-mod-status-index",
+				"falcon-theme"
 			]
 		}
 	},
@@ -21,7 +22,8 @@
 		},
 		"depends": {
 			"acl": [
-				"luci-mod-status-index"
+				"luci-mod-status-index",
+				"falcon-theme"
 			]
 		}
 	}

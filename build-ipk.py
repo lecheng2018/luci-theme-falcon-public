@@ -12,7 +12,7 @@ import tarfile
 
 BASE = os.path.abspath(os.path.dirname(__file__))
 PKG = "luci-theme-falcon"
-VERSION = "1.5.5"
+VERSION = "1.5.6"
 RELEASE = "1"
 ARCH = "all"
 OUT_NAME = f"{PKG}_{VERSION}-{RELEASE}_{ARCH}.ipk"
@@ -75,7 +75,8 @@ Description: Modern card-based LuCI theme with fibre/PON hardware overview.
 POSTINST = """#!/bin/sh
 [ -n "$IPKG_INSTROOT" ] || {
 	( . /etc/uci-defaults/30_luci-theme-falcon ) && rm -f /etc/uci-defaults/30_luci-theme-falcon
-	rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache*
+	/etc/init.d/rpcd restart 2>/dev/null || /etc/init.d/rpcd reload 2>/dev/null || killall -HUP rpcd 2>/dev/null || true
 	exit 0
 }
 """
@@ -87,7 +88,8 @@ PRERM = """#!/bin/sh
 		uci -q set luci.main.mediaurlbase="/luci-static/bootstrap"
 		uci -q commit luci
 	}
-	rm -rf /tmp/luci-indexcache /tmp/luci-modulecache
+	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache* /var/luci-indexcache*
+	/etc/init.d/rpcd restart 2>/dev/null || /etc/init.d/rpcd reload 2>/dev/null || killall -HUP rpcd 2>/dev/null || true
 	exit 0
 }
 """
